@@ -10,9 +10,9 @@ from main import (
     DoctorSearchResult, 
     DoctorExtractedData, 
     CollegeInfo,
-    interactive_search,
-    run_extraction_flow
+    app
 )
+from fastapi.testclient import TestClient
 
 # ----------------------------------------------------------------------------
 # Test 1: Search Agent extracts Practo URL from user input
@@ -129,11 +129,11 @@ async def test_search_agent_tool_call():
 
 
 # ----------------------------------------------------------------------------
-# Test 5: Jina Markdown Extractor
+# Test 5: Jina Markdown Extractor (WebSocket Flow)
 # ----------------------------------------------------------------------------
 @pytest.mark.asyncio
 async def test_jina_markdown_fetch(monkeypatch):
-    """Check that run_extraction_flow fetches markdown from Jina."""
+    """Check that the WebSocket flow fetches markdown from Jina and returns the final profile."""
     
     import httpx
     
@@ -153,14 +153,52 @@ async def test_jina_markdown_fetch(monkeypatch):
     # Monkeypatch the httpx.AsyncClient to avoid real network requests in CI
     monkeypatch.setattr(httpx, "AsyncClient", MockClient)
     
-    # Run the flow (we expect it to fail gracefully at the LLM extract step if no API key is set, 
-    # but we just want to ensure it calls the fetch)
-    with extraction_agent.override(model=TestModel(custom_output_args={"colleges":["Mock College"], "registrations":[]})):
-        with enrichment_agent.override(model=TestModel(custom_output_args={"name":"Mock College","is_government":True,"is_private":False})):
-            profile = await run_extraction_flow("Test Name", "Test Hosp", "mock-url.com")
-            assert profile is not None
-            assert profile.practo_url == "mock-url.com"
-            assert profile.colleges[0].name == "Mock College"
+    client = TestClient(app)
+    
+    # Mock the three agents to return expected deterministic data
+    mock_search = DoctorSearchResult(
+        practo_url="https://mock-url.com",
+        found_name="Mock Doc",
+        found_specialty="Mock Spec",
+        confidence_reasoning="Mocked"
+    )
+    
+    with search_agent.override(model=TestModel(custom_output_args=mock_search)):
+        with extraction_agent.override(model=TestModel(custom_output_args={"colleges":["Mock College"], "registrations":[]})):
+            with enrichment_agent.override(model=TestModel(custom_output_args={"name":"Mock College","is_government":True,"is_private":False})):
+                
+                # Connect to the WebSocket
+                with client.websocket_connect("/ws/extract") as websocket:
+                    # Send initial search payload
+                    websocket.send_json({"name": "Test Name", "hospital": "Test Hosp"})
+                    
+                    # Receive Searching Status
+                    status1 = websocket.receive_json()
+                    assert status1["type"] == "status"
+                    
+                    # Receive Search Result
+                    search_res = websocket.receive_json()
+                    assert search_res["type"] == "search_result"
+                    assert search_res["data"]["practo_url"] == "https://mock-url.com"
+                    
+                    # Send Confirmation
+                    websocket.send_json({"action": "confirm"})
+                    
+                    # Receive diverse status messages (Jina Fetch, Extracting, Routing...)
+                    # We loop until we get the final result or error
+                    final_data = None
+                    for _ in range(10): 
+                        msg = websocket.receive_json()
+                        if msg["type"] == "final_result":
+                            final_data = msg["data"]
+                            break
+                        elif msg["type"] == "error":
+                            pytest.fail(f"WebSocket flow errored: {msg['message']}")
+                            
+                    assert final_data is not None
+                    assert final_data["name"] == "Test Name"
+                    assert len(final_data["colleges"]) == 1
+                    assert final_data["colleges"][0]["name"] == "Mock College"
 
 
 # ----------------------------------------------------------------------------

@@ -1,11 +1,14 @@
 import os
 import asyncio
 from typing import List, Optional
+import json
 from pydantic import BaseModel, Field
 from pydantic_ai import Agent, RunContext
 import httpx
 from tavily import TavilyClient
 from dotenv import load_dotenv
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 
 # Load environment variables
 load_dotenv()
@@ -137,128 +140,139 @@ async def search_college_type(ctx: RunContext[None], college_name: str) -> str:
         return f"Error searching: {e}"
 
 # ---------------------------------------------------------
-# Application Flow
+# Application Flow: FastAPI WebSocket Endpoint
 # ---------------------------------------------------------
 
-async def interactive_search(name: str, hospital: str) -> str:
-    """Handles the interactive loop to find and confirm the Practo URL."""
-    additional_context = None
-    
-    while True:
-        print(f"\n[Search] Looking for Practo URL for {name} at {hospital}...")
-        
-        # Build prompt for the search agent
-        prompt = f"Find the Practo URL for Doctor Name: {name}, Hospital: {hospital}."
-        if additional_context:
-            prompt += f" Additional Context: {additional_context}"
-            
-        try:
-            result = await search_agent.run(prompt)
-            search_data = result.output
-            
-            if not search_data.practo_url:
-                print(f"[Search Failed] Could not find a matching URL. Reason: {search_data.confidence_reasoning}")
-            else:
-                print("\n[Search Result]")
-                print(f"URL:       {search_data.practo_url}")
-                print(f"Name:      {search_data.found_name}")
-                print(f"Specialty: {search_data.found_specialty}")
-                print(f"Reasoning: {search_data.confidence_reasoning}")
-            
-            user_input = input("\nIs this the correct doctor? (y / n / provide more context to retry): ").strip().lower()
-            
-            if user_input == 'y' or user_input == 'yes':
-                if search_data.practo_url:
-                     return search_data.practo_url
-                else:
-                     print("Cannot proceed without a valid URL. Please provide more context.")
-                     additional_context = input("Enter additional details (e.g., city, specific clinic): ")
-            elif user_input == 'n' or user_input == 'no':
-                 additional_context = input("Please enter additional details to refine the search (e.g., city, specific clinic): ")
-            else:
-                 # User provided context directly
-                 additional_context = user_input
-                 
-        except Exception as e:
-            print(f"[Agent Error] Search agent failed: {e}")
-            return None
+app = FastAPI(title="Doctor Data Extraction API")
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-async def run_extraction_flow(name: str, hospital: str, practo_url: str) -> DoctorFinalProfile:
-    """Runs the Jina scraping, LLM extraction, and enrichment pipeline."""
-    
-    print(f"\n[Scrape] Fetching markdown from {practo_url} using Jina Reader...")
+@app.websocket("/ws/extract")
+async def extract_doctor_data(websocket: WebSocket):
+    await websocket.accept()
     
     try:
-        # Request markdown via Jina Reader API
-        async with httpx.AsyncClient() as client:
-            jina_url = f"https://r.jina.ai/{practo_url}"
-            response = await client.get(jina_url, timeout=30.0)
+        # Step 1: Wait for Initial Search Request
+        data = await websocket.receive_text()
+        payload = json.loads(data)
+        
+        name = payload.get("name", "").strip()
+        hospital = payload.get("hospital", "").strip()
+        additional_context = payload.get("additional_context", None)
+        
+        if not name or not hospital:
+            await websocket.send_json({"type": "error", "message": "Name and Hospital are required."})
+            await websocket.close()
+            return
             
-            if response.status_code != 200:
-                print(f"[Scrape Error] Failed to get markdown content. Status code: {response.status_code}")
-                return None
+        practo_url = None
+        
+        # Loop for Search & Confirm
+        while True:
+            await websocket.send_json({"type": "status", "message": f"Searching the web for {name}..."})
+            
+            prompt = f"Find the Practo URL for Doctor Name: {name}, Hospital: {hospital}."
+            if additional_context:
+                prompt += f" Additional Context: {additional_context}"
                 
-            markdown_content = response.text
+            try:
+                result = await search_agent.run(prompt)
+                search_data = result.output
+                
+                if not search_data.practo_url:
+                     await websocket.send_json({
+                         "type": "search_failed", 
+                         "reasoning": search_data.confidence_reasoning
+                     })
+                     
+                     # Wait for refined context from user
+                     resp = await websocket.receive_text()
+                     resp_payload = json.loads(resp)
+                     
+                     if resp_payload.get("action") == "abort":
+                         return
+                         
+                     additional_context = resp_payload.get("additional_context")
+                else:
+                     await websocket.send_json({
+                         "type": "search_result",
+                         "data": search_data.model_dump()
+                     })
+                     
+                     # Wait for user confirmation
+                     resp = await websocket.receive_text()
+                     resp_payload = json.loads(resp)
+                     
+                     if resp_payload.get("action") == "confirm":
+                         practo_url = search_data.practo_url
+                         break
+                     elif resp_payload.get("action") == "refine":
+                         additional_context = resp_payload.get("additional_context")
+                     else:
+                         return # Aborted
+                         
+            except Exception as e:
+                await websocket.send_json({"type": "error", "message": f"Search agent failed: {str(e)}"})
+                return
+
+        # Stage 2: Scrape & Extract
+        await websocket.send_json({"type": "status", "message": f"Fetching markdown from {practo_url} using Jina..."})
+        
+        try:
+            async with httpx.AsyncClient() as client:
+                jina_url = f"https://r.jina.ai/{practo_url}"
+                response = await client.get(jina_url, timeout=30.0)
+                
+                if response.status_code != 200:
+                    await websocket.send_json({"type": "error", "message": f"Failed to get markdown content. Status code: {response.status_code}"})
+                    return
+                markdown_content = response.text
+                
+            if not markdown_content:
+                await websocket.send_json({"type": "error", "message": "Scraped markdown content is empty."})
+                return
+                
+            await websocket.send_json({"type": "status", "message": "Analyzing profile with Gemini..."})
+            extract_result = await extraction_agent.run(markdown_content)
+            extracted_data = extract_result.output
             
-        if not markdown_content:
-             print("[Scrape Error] Markdown content is empty.")
-             return None
-             
-        print("\n[Extract] Analyzing profile with Gemini...")
-        extract_result = await extraction_agent.run(markdown_content)
-        extracted_data = extract_result.output
-        
-        print(f"[Extract Success] Found {len(extracted_data.colleges)} colleges and {len(extracted_data.registrations)} registrations.")
-        
-        final_colleges = []
-        for college in extracted_data.colleges:
-             print(f"\n[Enrich] Determining type for college: {college}...")
-             enrich_result = await enrichment_agent.run(college)
-             final_colleges.append(enrich_result.output)
-             
-        # Construct and return final profile
-        return DoctorFinalProfile(
-             name=name,
-             hospital=hospital,
-             practo_url=practo_url,
-             colleges=final_colleges,
-             registrations=extracted_data.registrations
-        )
-             
+            await websocket.send_json({"type": "status", "message": f"Found {len(extracted_data.colleges)} colleges. Routing to Tavily..."})
+            
+            # Stage 3: Enrichment
+            final_colleges = []
+            for college in extracted_data.colleges:
+                 await websocket.send_json({"type": "status", "message": f"Determining type for college: {college}..."})
+                 enrich_result = await enrichment_agent.run(college)
+                 final_colleges.append(enrich_result.output)
+                 
+            # Construct final profile
+            final_profile = DoctorFinalProfile(
+                 name=name,
+                 hospital=hospital,
+                 practo_url=practo_url,
+                 colleges=final_colleges,
+                 registrations=extracted_data.registrations
+            )
+            
+            await websocket.send_json({
+                "type": "final_result",
+                "data": final_profile.model_dump()
+            })
+            
+        except Exception as e:
+            await websocket.send_json({"type": "error", "message": f"Extraction failed: {str(e)}"})
+            
+    except WebSocketDisconnect:
+        print("Client disconnected.")
     except Exception as e:
-        print(f"[Pipeline Error] Extraction failed: {e}")
-        return None
-
-# ---------------------------------------------------------
-# Main Execution
-# ---------------------------------------------------------
-
-async def main():
-    print("=== Doctor Data Extraction Agent ===")
-    
-    # Get basic details
-    name = input("Enter Doctor's Name: ").strip()
-    if not name:
-        name = "Dr. Sample" # Default for quick testing
-        
-    hospital = input("Enter Hospital Name: ").strip()
-    if not hospital:
-        hospital = "Apollo Hospital"
-    
-    # Stage 1: Search & Confirm
-    practo_url = await interactive_search(name, hospital)
-    
-    if not practo_url:
-        print("Flow aborted.")
-        return
-        
-    # Stage 2 & 3: Extract & Enrich
-    final_profile = await run_extraction_flow(name, hospital, practo_url)
-    
-    if final_profile:
-        print("\n=== Final Extracted Profile ===")
-        print(final_profile.model_dump_json(indent=2))
+        print(f"Unexpected connection error: {e}")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
