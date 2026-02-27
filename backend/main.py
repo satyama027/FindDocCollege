@@ -41,7 +41,8 @@ class DoctorSearchInput(BaseModel):
     additional_context: Optional[str] = Field(default=None, description="Any additional context provided by the user to refine the search")
 
 class DoctorSearchResult(BaseModel):
-    practo_url: Optional[str] = Field(description="The Practo URL found for the doctor. None if not found.")
+    profile_url: Optional[str] = Field(description="The URL found for the doctor's profile. None if not found.")
+    source_platform: Optional[str] = Field(description="The name of the platform the profile was found on (e.g., Practo, Lybrate, Apollo, NMR, SMC).")
     found_name: Optional[str] = Field(description="The name of the doctor as it appeared in the search results.")
     found_specialty: Optional[str] = Field(description="The specialty of the doctor as it appeared in the search results.")
     confidence_reasoning: str = Field(description="Brief explanation of why this URL was chosen or why it was not found.")
@@ -60,7 +61,8 @@ class DoctorFinalProfile(BaseModel):
     """The final structured output of the agent"""
     name: str
     hospital: str
-    practo_url: str
+    profile_url: str
+    source_platform: str
     colleges: List[CollegeInfo] = Field(description="Colleges the doctor studied at, along with institution type")
     registrations: List[str] = Field(description="Medical council registrations")
 
@@ -73,26 +75,30 @@ search_agent = Agent(
     MODEL,
     output_type=DoctorSearchResult,
     system_prompt=(
-        "You are an expert search assistant. Your goal is to find the correct Practo profile URL "
-        "for a specific doctor based on the user's provided details. "
-        "Use the `search_practo_url` tool to query the web. "
-        "Analyze the search snippets to ensure the URL matches the doctor's name, hospital, and any additional context. "
-        "If you find a matching URL, extract the doctor's name and specialty from the snippet and return them."
+        "You are an expert search assistant. Your goal is to find a reliable online profile URL "
+        "for a specific medical doctor based on the user's provided name and hospital.\n\n"
+        "You must prioritize sources in this exact order:\n"
+        "1. Practo\n"
+        "2. The specific Hospital's official website (e.g., Apollo, Fortis, Manipal)\n"
+        "3. Lybrate or JustDial\n"
+        "4. State Medical Council (SMC) directories or National Medical Register (NMR) indexers\n\n"
+        "Use the `search_profile_url` tool to query the web. "
+        "Analyze the search snippets to ensure the URL matches the doctor's identity. "
+        "If you find a matching URL, extract the doctor's name, specialty, the exact URL, and identify the `source_platform` (e.g., 'Practo', 'Apollo Hospitals', 'Lybrate')."
     )
 )
 
 @search_agent.tool
-async def search_practo_url(ctx: RunContext[None], query: str) -> str:
-    """Searches the web using Tavily to find Practo profile URLs."""
+async def search_profile_url(ctx: RunContext[None], query: str) -> str:
+    """Searches the web using Tavily to find doctor profiles across multiple trusted healthcare domains."""
     if not tavily_client:
         return "Error: Tavily client not initialized (missing API key)."
     try:
-        # Force site:practo.com in the query if the agent didn't include it
-        if "site:practo.com" not in query:
-             query += " site:practo.com"
+        # If the LLM generates a very generic query without a site constraint, we can append trusted medical domains to guide the search.
+        # But we also want to allow the LLM to write "site:apollo.com" if it chooses to.
         search_result = tavily_client.search(query=query, search_depth="basic")
         results = search_result.get('results', [])
-        # Return a formatted string of the top results so the agent can analyze them
+        
         formatted_results = []
         for r in results:
              formatted_results.append(f"URL: {r['url']}\nContent: {r['content']}\n")
@@ -171,13 +177,14 @@ async def extract_doctor_data(websocket: WebSocket):
             await websocket.close()
             return
             
-        practo_url = None
+        profile_url = None
+        source_platform = None
         
         # Loop for Search & Confirm
         while True:
-            await websocket.send_json({"type": "status", "message": f"Searching the web for {name}..."})
+            await websocket.send_json({"type": "status", "message": f"Searching multiple sources for {name}..."})
             
-            prompt = f"Find the Practo URL for Doctor Name: {name}, Hospital: {hospital}."
+            prompt = f"Find a profile URL for Doctor Name: {name}, Hospital: {hospital}."
             if additional_context:
                 prompt += f" Additional Context: {additional_context}"
                 
@@ -185,7 +192,7 @@ async def extract_doctor_data(websocket: WebSocket):
                 result = await search_agent.run(prompt)
                 search_data = result.output
                 
-                if not search_data.practo_url:
+                if not search_data.profile_url:
                      await websocket.send_json({
                          "type": "search_failed", 
                          "reasoning": search_data.confidence_reasoning
@@ -210,7 +217,8 @@ async def extract_doctor_data(websocket: WebSocket):
                      resp_payload = json.loads(resp)
                      
                      if resp_payload.get("action") == "confirm":
-                         practo_url = search_data.practo_url
+                         profile_url = search_data.profile_url
+                         source_platform = search_data.source_platform
                          break
                      elif resp_payload.get("action") == "refine":
                          additional_context = resp_payload.get("additional_context")
@@ -222,11 +230,11 @@ async def extract_doctor_data(websocket: WebSocket):
                 return
 
         # Stage 2: Scrape & Extract
-        await websocket.send_json({"type": "status", "message": f"Fetching markdown from {practo_url} using Jina..."})
+        await websocket.send_json({"type": "status", "message": f"Fetching markdown from {source_platform} via Jina..."})
         
         try:
             async with httpx.AsyncClient() as client:
-                jina_url = f"https://r.jina.ai/{practo_url}"
+                jina_url = f"https://r.jina.ai/{profile_url}"
                 response = await client.get(jina_url, timeout=30.0)
                 
                 if response.status_code != 200:
@@ -255,7 +263,8 @@ async def extract_doctor_data(websocket: WebSocket):
             final_profile = DoctorFinalProfile(
                  name=name,
                  hospital=hospital,
-                 practo_url=practo_url,
+                 profile_url=profile_url,
+                 source_platform=source_platform,
                  colleges=final_colleges,
                  registrations=extracted_data.registrations
             )

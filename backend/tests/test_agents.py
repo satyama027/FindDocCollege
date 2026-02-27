@@ -24,7 +24,8 @@ async def test_search_agent():
     # We use PydanticAI's TestModel to mock the Gemini LLM
     # We tell it to return a specific piece of structured data when called
     mocked_search_result = {
-        "practo_url": "https://www.practo.com/bangalore/doctor/sushanth-shivaswamy-pediatrician",
+        "profile_url": "https://www.practo.com/bangalore/doctor/sushanth-shivaswamy-pediatrician",
+        "source_platform": "Practo",
         "found_name": "Dr. Sushanth Shivaswamy",
         "found_specialty": "Pediatrician",
         "confidence_reasoning": "Found exact match on Practo search results."
@@ -36,7 +37,8 @@ async def test_search_agent():
         result = await search_agent.run(prompt)
         
         # Verify the agent returned the expected output format and data
-        assert result.output.practo_url == "https://www.practo.com/bangalore/doctor/sushanth-shivaswamy-pediatrician"
+        assert result.output.profile_url == "https://www.practo.com/bangalore/doctor/sushanth-shivaswamy-pediatrician"
+        assert result.output.source_platform == "Practo"
         assert result.output.found_name == "Dr. Sushanth Shivaswamy"
 
 
@@ -107,11 +109,12 @@ async def test_enrichment_agent():
 # ----------------------------------------------------------------------------
 @pytest.mark.asyncio
 async def test_search_agent_tool_call():
-    """Check that the search_agent actually uses the search_practo_url tool."""
+    """Check that the search_agent actually uses the search_profile_url tool."""
     
     # We use a spy/mock model to verify the agent requested the correct tool call
     mock_response = DoctorSearchResult(
-        practo_url="https://practo.com/mock",
+        profile_url="https://practo.com/mock",
+        source_platform="Practo",
         found_name="Mock Doc",
         found_specialty="Mock Spec",
         confidence_reasoning="Mocked test."
@@ -125,7 +128,7 @@ async def test_search_agent_tool_call():
         # We don't have a direct Tavily mock easily injectable here without monkeypatching, 
         # but we can verify the Agent's thought process successfully yielded the output.
         # If it throws no errors and returns our mock model output type, the routing worked.
-        assert result.output.practo_url == "https://practo.com/mock"
+        assert result.output.profile_url == "https://practo.com/mock"
 
 
 # ----------------------------------------------------------------------------
@@ -157,7 +160,8 @@ async def test_jina_markdown_fetch(monkeypatch):
     
     # Mock the three agents to return expected deterministic data
     mock_search = DoctorSearchResult(
-        practo_url="https://mock-url.com",
+        profile_url="https://mock-url.com",
+        source_platform="MockSource",
         found_name="Mock Doc",
         found_specialty="Mock Spec",
         confidence_reasoning="Mocked"
@@ -179,7 +183,8 @@ async def test_jina_markdown_fetch(monkeypatch):
                     # Receive Search Result
                     search_res = websocket.receive_json()
                     assert search_res["type"] == "search_result"
-                    assert search_res["data"]["practo_url"] == "https://mock-url.com"
+                    assert search_res["data"]["profile_url"] == "https://mock-url.com"
+                    assert search_res["data"]["source_platform"] == "MockSource"
                     
                     # Send Confirmation
                     websocket.send_json({"action": "confirm"})
