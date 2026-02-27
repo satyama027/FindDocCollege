@@ -1,0 +1,8 @@
+pydantic-ai
+google-genai
+httpx
+tavily-python
+pydantic
+python-dotenv
+pytest
+pytest-asyncio
