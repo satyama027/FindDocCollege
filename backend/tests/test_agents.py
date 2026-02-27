@@ -125,10 +125,32 @@ async def test_search_agent_tool_call():
         prompt = "Find URL for John Doe at Apollo Hospital."
         result = await search_agent.run(prompt)
         
-        # We don't have a direct Tavily mock easily injectable here without monkeypatching, 
-        # but we can verify the Agent's thought process successfully yielded the output.
-        # If it throws no errors and returns our mock model output type, the routing worked.
+        # Verify the Agent's thought process successfully yielded the output.
         assert result.output.profile_url == "https://practo.com/mock"
+
+# ----------------------------------------------------------------------------
+# Test 4b: Search Agent prioritizes fallbacks correctly
+# ----------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_search_agent_fallback_priority():
+    """Verify that the agent correctly falls back to Lybrate or Hospital sites if Practo isn't available."""
+    
+    fallback_mock_response = DoctorSearchResult(
+        profile_url="https://www.lybrate.com/mock",
+        source_platform="Lybrate",
+        found_name="Mock Doc",
+        found_specialty="Mock Spec",
+        confidence_reasoning="Used Lybrate as fallback."
+    )
+    
+    with search_agent.override(model=TestModel(custom_output_args=fallback_mock_response)):
+        prompt = "Find URL for Jane Doe at City Hospital. Practo URL does not exist."
+        result = await search_agent.run(prompt)
+        
+        # Verify the agent returned the fallback Lybrate URL
+        assert result.output.profile_url == "https://www.lybrate.com/mock"
+        assert result.output.source_platform == "Lybrate"
+
 
 
 # ----------------------------------------------------------------------------
