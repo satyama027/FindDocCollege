@@ -152,6 +152,96 @@ async def test_search_agent_fallback_priority():
         assert result.output.source_platform == "Lybrate"
 
 
+# ----------------------------------------------------------------------------
+# Test 4c: Search Agent - Hospital Site Fallback
+# ----------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_search_agent_hospital_fallback():
+    """Verify that the agent correctly identifies an official hospital website profile."""
+    
+    mock_response = DoctorSearchResult(
+        profile_url="https://www.apollohospitals.com/mock-doc",
+        source_platform="Apollo Hospitals",
+        found_name="Dr. Apollo Mock",
+        found_specialty="Cardiology",
+        confidence_reasoning="Found on official Apollo site."
+    )
+    
+    with search_agent.override(model=TestModel(custom_output_args=mock_response)):
+        prompt = "Find URL for Dr. Apollo Mock at Apollo Hospitals."
+        result = await search_agent.run(prompt)
+        
+        assert "apollohospitals.com" in result.output.profile_url
+        assert result.output.source_platform == "Apollo Hospitals"
+
+
+# ----------------------------------------------------------------------------
+# Test 4d: Search Agent - National Medical Register (NMR) via Aggregator Fallback
+# ----------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_search_agent_nmr_fallback():
+    """Verify the agent can parse an NMR registration from a public registry scraper."""
+    
+    mock_response = DoctorSearchResult(
+        profile_url="https://indianmedicalregistry.org/mock-doc-nmr",
+        source_platform="NMR Public Registry",
+        found_name="Dr. NMR Mock",
+        found_specialty="General Medicine",
+        confidence_reasoning="Found NMR registration number in public registry scraper."
+    )
+    
+    with search_agent.override(model=TestModel(custom_output_args=mock_response)):
+        prompt = "Find URL for Dr. NMR Mock. Not on Practo or hospital sites."
+        result = await search_agent.run(prompt)
+        
+        assert result.output.source_platform == "NMR Public Registry"
+
+
+# ----------------------------------------------------------------------------
+# Test 4e: Search Agent - State Medical Council (SMC) Fallback
+# ----------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_search_agent_smc_fallback():
+    """Verify the agent identifies a doctor from a state medical council's public PDF or page."""
+    
+    mock_response = DoctorSearchResult(
+        profile_url="https://karnatakamedicalcouncil.com/mock-doc-reg",
+        source_platform="Karnataka Medical Council (SMC)",
+        found_name="Dr. SMC Mock",
+        found_specialty="Unknown",
+        confidence_reasoning="Found SMC registration page."
+    )
+    
+    with search_agent.override(model=TestModel(custom_output_args=mock_response)):
+        prompt = "Find Karnataka Medical Council registration for Dr. SMC Mock."
+        result = await search_agent.run(prompt)
+        
+        assert "karnatakamedicalcouncil.com" in result.output.profile_url
+        assert "SMC" in result.output.source_platform
+
+
+# ----------------------------------------------------------------------------
+# Test 4f: Search Agent - JustDial Fallback
+# ----------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_search_agent_justdial_fallback():
+    """Verify the agent correctly identifies a JustDial profile."""
+    
+    mock_response = DoctorSearchResult(
+        profile_url="https://www.justdial.com/mock-doc",
+        source_platform="JustDial",
+        found_name="Dr. JustDial Mock",
+        found_specialty="Dentist",
+        confidence_reasoning="Found on JustDial."
+    )
+    
+    with search_agent.override(model=TestModel(custom_output_args=mock_response)):
+        prompt = "Find URL for Dr. JustDial Mock."
+        result = await search_agent.run(prompt)
+        
+        assert result.output.profile_url == "https://www.justdial.com/mock-doc"
+        assert result.output.source_platform == "JustDial"
+
 
 # ----------------------------------------------------------------------------
 # Test 5: Jina Markdown Extractor (WebSocket Flow)
