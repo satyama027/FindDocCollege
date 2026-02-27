@@ -331,9 +331,150 @@ async def test_enrichment_agent_tool_call():
         "is_private": True
     }
     
-    # We test that the framework routes the string to the model correctly
     with enrichment_agent.override(model=TestModel(custom_output_args=mocked_college_info, call_tools='all')):
         result = await enrichment_agent.run("Live College Test")
         assert result.output.is_government is False
+
+
+# ----------------------------------------------------------------------------
+# Test 7: Extraction Fallback Loop
+# ----------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_extraction_fallback_loop(monkeypatch):
+    """Verify that if the first extracted profile yields 0 colleges, the agent searches again."""
+    
+    import httpx
+    
+    class MockResponse:
+        status_code = 200
+        text = "# Mock Markdown from Jina"
+        
+    class MockClient:
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+        async def get(self, url, timeout):
+            return MockResponse()
+
+    monkeypatch.setattr(httpx, "AsyncClient", MockClient)
+    client = TestClient(app)
+    
+    class MockResponse:
+        status_code = 200
+        text = "# Mock Markdown from Jina"
+        
+    class MockClient:
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+        async def get(self, url, timeout):
+            return MockResponse()
+
+    monkeypatch.setattr(httpx, "AsyncClient", MockClient)
+    
+    # Create Mocks
+    mock_search_1 = DoctorSearchResult(
+        profile_url="https://justdial.com/mock",
+        source_platform="JustDial",
+        found_name="Mock Doc",
+        found_specialty="Mock Spec",
+        confidence_reasoning="Found JustDial"
+    )
+    mock_search_2 = DoctorSearchResult(
+        profile_url="https://lybrate.com/mock",
+        source_platform="Lybrate",
+        found_name="Mock Doc",
+        found_specialty="Mock Spec",
+        confidence_reasoning="Found Lybrate"
+    )
+
+    search_calls = [0]
+    async def mock_search_run(prompt: str, **kwargs):
+        class MockRunResult:
+            def __init__(self, data):
+                self.output = data
+        if "JustDial" not in str(prompt) and "Lybrate" not in str(prompt) and search_calls[0] == 0:
+            search_calls[0] += 1
+            return MockRunResult(mock_search_1)
+        search_calls[0] += 1
+        return MockRunResult(mock_search_2)
+
+    extract_calls = [0]
+    async def mock_extract_run(content: str, **kwargs):
+        class MockExtractResult:
+            def __init__(self, data):
+                self.output = DoctorExtractedData(**data)
+        if extract_calls[0] == 0:
+            extract_calls[0] += 1
+            return MockExtractResult({"colleges": [], "registrations": []})
+        return MockExtractResult({"colleges": ["Mock College"], "registrations": ["Mock Reg"]})
+
+    async def mock_enrich_run(college: str, **kwargs):
+        class MockEnrichResult:
+            def __init__(self):
+                self.output = CollegeInfo(name="Mock College", is_government=True, is_private=False)
+        return MockEnrichResult()
+
+    import main
+    monkeypatch.setattr(main.search_agent, "run", mock_search_run)
+    monkeypatch.setattr(main.extraction_agent, "run", mock_extract_run)
+    monkeypatch.setattr(main.enrichment_agent, "run", mock_enrich_run)
+    
+    with client.websocket_connect("/ws/extract") as websocket:
+        # 1. Initial Search
+        websocket.send_json({"name": "Test Name", "hospital": "Test Hosp"})
+        
+        # We need to loop receiving until we find the first search_result
+        import time
+        start = time.time()
+        res1 = None
+        while True:
+            if time.time() - start > 5:
+                pytest.fail("Test timed out waiting for FIRST search result.")
+            msg = websocket.receive_json()
+            if msg["type"] == "search_result":
+                res1 = msg
+                break
+                
+        assert res1["data"]["source_platform"] == "JustDial"
+        
+        # 2. Confirm First Result -> Leads to 0 Colleges
+        websocket.send_json({"action": "confirm"})
+        
+        # Receive status messages until the loop triggers the SECOND search
+        start2 = time.time()
+        res2 = None
+        while True:
+            if time.time() - start2 > 5:
+                pytest.fail("Test timed out waiting for second search result.")
+                
+            msg = websocket.receive_json()
+            if msg["type"] == "search_result":
+                res2 = msg
+                break
+            elif msg["type"] == "error" or msg["type"] == "final_result":
+                pytest.fail(f"Agent did not loop back to search phase. Error: {msg}")
+                
+        assert res2["data"]["source_platform"] == "Lybrate"
+        
+        # 3. Confirm Second Result -> Leads to 1 College (Success)
+        websocket.send_json({"action": "confirm"})
+        
+        start3 = time.time()
+        final_data = None
+        while True:
+            if time.time() - start3 > 5:
+                pytest.fail("Test timed out waiting for final result.")
+            msg = websocket.receive_json()
+            if msg["type"] == "final_result":
+                final_data = msg["data"]
+                break
+            elif msg["type"] == "error":
+                pytest.fail(f"Agent errored during second extraction. {msg}")
+                
+        assert final_data["source_platform"] == "Lybrate"
+        assert len(final_data["colleges"]) == 1
 
 

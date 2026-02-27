@@ -49,8 +49,8 @@ class DoctorSearchResult(BaseModel):
 
 class DoctorExtractedData(BaseModel):
     """Data extracted directly from the Firecrawl scrape"""
-    colleges: List[str] = Field(description="List of college or university names where the given doctor studied.")
-    registrations: List[str] = Field(description="Registration details, such as registration number and medical council.")
+    colleges: List[str] = Field(default_factory=list, description="List of college or university names where the given doctor studied.")
+    registrations: List[str] = Field(default_factory=list, description="Registration details, such as registration number and medical council.")
 
 class CollegeInfo(BaseModel):
     name: str = Field(description="Name of the college or university")
@@ -180,103 +180,119 @@ async def extract_doctor_data(websocket: WebSocket):
             
         profile_url = None
         source_platform = None
+        tried_urls = []
         
-        # Loop for Search & Confirm
+        # Outer Loop: If extraction fails or finds 0 colleges, we come back here to find a NEW profile
         while True:
-            await websocket.send_json({"type": "status", "message": f"Searching multiple sources for {name}..."})
-            
-            prompt = f"Find a profile URL for Doctor Name: {name}, Hospital: {hospital}."
-            if additional_context:
-                prompt += f" Additional Context: {additional_context}"
+            # Loop for Search & Confirm
+            while True:
+                await websocket.send_json({"type": "status", "message": f"Searching multiple sources for {name}..."})
                 
-            try:
-                result = await search_agent.run(prompt)
-                search_data = result.output
+                prompt = f"Find a profile URL for Doctor Name: {name}, Hospital: {hospital}."
+                if additional_context:
+                    prompt += f" Additional Context: {additional_context}"
                 
-                if not search_data.profile_url:
-                     await websocket.send_json({
-                         "type": "search_failed", 
-                         "reasoning": search_data.confidence_reasoning
-                     })
-                     
-                     # Wait for refined context from user
-                     resp = await websocket.receive_text()
-                     resp_payload = json.loads(resp)
-                     
-                     if resp_payload.get("action") == "abort":
-                         return
+                # Instruct the agent to ignore profiles that previously yielded 0 colleges
+                if tried_urls:
+                    prompt += f" DO NOT return any of these URLs: {', '.join(tried_urls)}"
+                    
+                try:
+                    result = await search_agent.run(prompt)
+                    search_data = result.output
+                    
+                    if not search_data.profile_url:
+                         await websocket.send_json({
+                             "type": "search_failed", 
+                             "reasoning": search_data.confidence_reasoning
+                         })
                          
-                     additional_context = resp_payload.get("additional_context")
-                else:
-                     await websocket.send_json({
-                         "type": "search_result",
-                         "data": search_data.model_dump()
-                     })
-                     
-                     # Wait for user confirmation
-                     resp = await websocket.receive_text()
-                     resp_payload = json.loads(resp)
-                     
-                     if resp_payload.get("action") == "confirm":
-                         profile_url = search_data.profile_url
-                         source_platform = search_data.source_platform
-                         break
-                     elif resp_payload.get("action") == "refine":
+                         # Wait for refined context from user
+                         resp = await websocket.receive_text()
+                         resp_payload = json.loads(resp)
+                         
+                         if resp_payload.get("action") == "abort":
+                             return
+                             
                          additional_context = resp_payload.get("additional_context")
-                     else:
-                         return # Aborted
+                    else:
+                         await websocket.send_json({
+                             "type": "search_result",
+                             "data": search_data.model_dump()
+                         })
                          
-            except Exception as e:
-                await websocket.send_json({"type": "error", "message": f"Search agent failed: {str(e)}"})
-                return
-
-        # Stage 2: Scrape & Extract
-        await websocket.send_json({"type": "status", "message": f"Fetching markdown from {source_platform} via Jina..."})
-        
-        try:
-            async with httpx.AsyncClient() as client:
-                jina_url = f"https://r.jina.ai/{profile_url}"
-                response = await client.get(jina_url, timeout=30.0)
-                
-                if response.status_code != 200:
-                    await websocket.send_json({"type": "error", "message": f"Failed to get markdown content. Status code: {response.status_code}"})
+                         # Wait for user confirmation
+                         resp = await websocket.receive_text()
+                         resp_payload = json.loads(resp)
+                         
+                         if resp_payload.get("action") == "confirm":
+                             profile_url = search_data.profile_url
+                             source_platform = search_data.source_platform
+                             break
+                         elif resp_payload.get("action") == "refine":
+                             additional_context = resp_payload.get("additional_context")
+                         else:
+                             return # Aborted
+                             
+                except Exception as e:
+                    await websocket.send_json({"type": "error", "message": f"Search agent failed: {str(e)}"})
                     return
-                markdown_content = response.text
+
+            # Stage 2: Scrape & Extract
+            await websocket.send_json({"type": "status", "message": f"Fetching markdown from {source_platform} via Jina..."})
+            
+            try:
+                async with httpx.AsyncClient() as client:
+                    jina_url = f"https://r.jina.ai/{profile_url}"
+                    response = await client.get(jina_url, timeout=30.0)
+                    
+                    if response.status_code != 200:
+                        await websocket.send_json({"type": "error", "message": f"Failed to get markdown content. Status code: {response.status_code}"})
+                        return
+                    markdown_content = response.text
+                    
+                if not markdown_content:
+                    await websocket.send_json({"type": "error", "message": "Scraped markdown content is empty."})
+                    return
+                    
+                await websocket.send_json({"type": "status", "message": "Analyzing profile with Gemini..."})
+                extract_result = await extraction_agent.run(markdown_content)
+                extracted_data = extract_result.output
                 
-            if not markdown_content:
-                await websocket.send_json({"type": "error", "message": "Scraped markdown content is empty."})
-                return
+                # Stage 3: Enrichment
+                if not extracted_data.colleges:
+                    await websocket.send_json({"type": "status", "message": f"No educational data found on {source_platform}. Adding to blocklist and searching for an alternative profile..."})
+                    tried_urls.append(profile_url)
+                    continue # Loop back to the very top (Stage 1 search) to find a new URL
+                    
+                await websocket.send_json({"type": "status", "message": f"Found {len(extracted_data.colleges)} colleges. Routing to Tavily..."})
                 
-            await websocket.send_json({"type": "status", "message": "Analyzing profile with Gemini..."})
-            extract_result = await extraction_agent.run(markdown_content)
-            extracted_data = extract_result.output
-            
-            await websocket.send_json({"type": "status", "message": f"Found {len(extracted_data.colleges)} colleges. Routing to Tavily..."})
-            
-            # Stage 3: Enrichment
-            final_colleges = []
-            for college in extracted_data.colleges:
-                 await websocket.send_json({"type": "status", "message": f"Determining type for college: {college}..."})
-                 enrich_result = await enrichment_agent.run(college)
-                 final_colleges.append(enrich_result.output)
-                 
-            # Construct final profile
-            final_profile = DoctorFinalProfile(
-                 name=name,
-                 hospital=hospital,
-                 profile_url=profile_url,
-                 source_platform=source_platform,
-                 colleges=final_colleges,
-                 registrations=extracted_data.registrations
-            )
-            
-            await websocket.send_json({
-                "type": "final_result",
-                "data": final_profile.model_dump()
-            })
-            
-        except Exception as e:
-            await websocket.send_json({"type": "error", "message": f"Extraction failed: {str(e)}"})
+                final_colleges = []
+                for college in extracted_data.colleges:
+                     await websocket.send_json({"type": "status", "message": f"Determining type for college: {college}..."})
+                     enrich_result = await enrichment_agent.run(college)
+                     final_colleges.append(enrich_result.output)
+                     
+                # Construct final profile
+                final_profile = DoctorFinalProfile(
+                     name=name,
+                     hospital=hospital,
+                     profile_url=profile_url,
+                     source_platform=source_platform,
+                     colleges=final_colleges,
+                     registrations=extracted_data.registrations
+                )
+                
+                await websocket.send_json({
+                    "type": "final_result",
+                    "data": final_profile.model_dump()
+                })
+                
+                # End the outer loop after a successful extraction
+                break
+                
+            except Exception as e:
+                await websocket.send_json({"type": "error", "message": f"Extraction failed: {str(e)}"})
+                break
             
     except WebSocketDisconnect:
         print("Client disconnected.")
