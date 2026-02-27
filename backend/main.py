@@ -9,6 +9,8 @@ from tavily import TavilyClient
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 
 # Load environment variables
 load_dotenv()
@@ -298,6 +300,32 @@ async def extract_doctor_data(websocket: WebSocket):
         print("Client disconnected.")
     except Exception as e:
         print(f"Unexpected connection error: {e}")
+
+# ---------------------------------------------------------
+# Serve React Frontend (Monolith)
+# ---------------------------------------------------------
+
+# Ensure we don't crash on local dev if the 'dist' folder doesn't exist yet
+dist_path = os.path.join(os.path.dirname(__file__), "..", "frontend", "dist")
+assets_path = os.path.join(dist_path, "assets")
+
+if os.path.exists(assets_path):
+    app.mount("/assets", StaticFiles(directory=assets_path), name="assets")
+
+@app.get("/{catchall:path}")
+def serve_react_app(catchall: str):
+    file_path = os.path.join(dist_path, catchall)
+    
+    # If the user is requesting a specific file like favicon.ico
+    if os.path.exists(file_path) and os.path.isfile(file_path):
+        return FileResponse(file_path)
+    
+    # Otherwise, fall back to the React index.html for client-side routing
+    index_path = os.path.join(dist_path, "index.html")
+    if os.path.exists(index_path):
+        return FileResponse(index_path)
+        
+    return {"error": "Frontend build not found. During local development, you can ignore this and continue using localhost:5173 for the frontend."}
 
 if __name__ == "__main__":
     import uvicorn
