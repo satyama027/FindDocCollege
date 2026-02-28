@@ -192,6 +192,7 @@ async def extract_doctor_data(websocket: WebSocket):
         profile_url = None
         source_platform = None
         tried_urls = []
+        platform_retries = {}
         
         # Outer Loop: If extraction fails or finds 0 colleges, we come back here to find a NEW profile
         while True:
@@ -199,7 +200,12 @@ async def extract_doctor_data(websocket: WebSocket):
             while True:
                 await websocket.send_json({"type": "status", "message": f"Searching multiple sources for {name}..."})
                 
-                prompt = f"Find a profile URL for Doctor Name: {name}, Hospital: {hospital}."
+                # Check if we are retrying a specific platform
+                if source_platform and platform_retries.get(source_platform, 0) == 1:
+                    prompt = f"The URL you provided for {source_platform} returned no educational data. Please search again and provide a CORRECTED URL for {source_platform}, or a different profile link on the same site for {name} at {hospital}."
+                else:
+                    prompt = f"Find a profile URL for Doctor Name: {name}, Hospital: {hospital}."
+                    
                 if additional_context:
                     prompt += f" Additional Context: {additional_context}"
                 
@@ -273,9 +279,14 @@ async def extract_doctor_data(websocket: WebSocket):
                 extracted_data = extract_result.output
                 
                 if not extracted_data.colleges:
-                    await websocket.send_json({"type": "status", "message": f"No educational data found on {source_platform}. Adding to blocklist and searching for an alternative profile..."})
-                    tried_urls.append(profile_url)
-                    continue # Loop back to the very top (Stage 1 search) to find a new URL
+                    if platform_retries.get(source_platform, 0) < 1:
+                        platform_retries[source_platform] = platform_retries.get(source_platform, 0) + 1
+                        await websocket.send_json({"type": "status", "message": f"No educational data found on {source_platform}. Retrying to find a valid URL for this platform..."})
+                        continue
+                    else:
+                        await websocket.send_json({"type": "status", "message": f"Retries exhausted. No educational data found on {source_platform}. Adding to blocklist and searching alternative platforms..."})
+                        tried_urls.append(profile_url)
+                        continue # Loop back to the very top (Stage 1 search) to find a new URL
                     
                 # Quality Check: Ensure at least one college is properly named
                 has_valid_college = False
@@ -286,9 +297,14 @@ async def extract_doctor_data(websocket: WebSocket):
                         break
                         
                 if not has_valid_college:
-                    await websocket.send_json({"type": "status", "message": f"Data found on {source_platform} lacks institution names. Rejecting and searching for an alternative..."})
-                    tried_urls.append(profile_url)
-                    continue
+                    if platform_retries.get(source_platform, 0) < 1:
+                        platform_retries[source_platform] = platform_retries.get(source_platform, 0) + 1
+                        await websocket.send_json({"type": "status", "message": f"Data found on {source_platform} lacks institution names. Retrying to find a better URL..."})
+                        continue
+                    else:
+                        await websocket.send_json({"type": "status", "message": f"Retries exhausted. Data found on {source_platform} lacks institution names. Rejecting and searching for an alternative..."})
+                        tried_urls.append(profile_url)
+                        continue
                     
                 await websocket.send_json({"type": "status", "message": f"Found {len(extracted_data.colleges)} colleges. Routing to Tavily..."})
                 
