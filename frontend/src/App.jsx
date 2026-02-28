@@ -15,8 +15,10 @@ function App() {
   const connectWebSocket = () => {
     if (ws.current) ws.current.close();
 
-    // Connect to FastAPI backend
-    ws.current = new WebSocket('ws://127.0.0.1:8000/ws/extract');
+    // Connect to FastAPI backend dynamically based on environment
+    const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const wsHost = import.meta.env.DEV ? '127.0.0.1:8000' : window.location.host;
+    ws.current = new WebSocket(`${wsProtocol}//${wsHost}/ws/extract`);
 
     ws.current.onopen = () => {
       // Send initial payload
