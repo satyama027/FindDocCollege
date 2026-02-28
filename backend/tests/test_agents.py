@@ -486,4 +486,119 @@ async def test_extraction_fallback_loop(monkeypatch):
         assert final_data["source_platform"] == "Lybrate"
         assert len(final_data["colleges"]) == 1
 
+# ----------------------------------------------------------------------------
+# Test 8: Extraction Fallback for Poor Quality Data (No valid institution name)
+# ----------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_extraction_fallback_quality_check(monkeypatch):
+    """Verify that if the extracted college name is invalid ('unspecified'), it falls back to a new search."""
+    
+    import httpx
+    
+    class MockResponse:
+        status_code = 200
+        text = "# Mock Markdown from Jina"
+        
+    class MockClient:
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+        async def get(self, url, timeout):
+            return MockResponse()
 
+    monkeypatch.setattr(httpx, "AsyncClient", MockClient)
+    client = TestClient(app)
+    
+    mock_search_1 = DoctorSearchResult(
+        profile_url="https://cloudnine.com/mock",
+        source_platform="Cloudnine Hospitals",
+        found_name="Mock Doc",
+        found_specialty="Mock Spec",
+        confidence_reasoning="Found Cloudnine"
+    )
+    mock_search_2 = DoctorSearchResult(
+        profile_url="https://practo.com/mock",
+        source_platform="Practo",
+        found_name="Mock Doc",
+        found_specialty="Mock Spec",
+        confidence_reasoning="Found Practo"
+    )
+
+    search_calls = [0]
+    async def mock_search_run(prompt: str, **kwargs):
+        class MockRunResult:
+            def __init__(self, data):
+                self.output = data
+        if "cloudnine.com/mock" not in str(prompt) and search_calls[0] == 0:
+            search_calls[0] += 1
+            return MockRunResult(mock_search_1)
+        search_calls[0] += 1
+        return MockRunResult(mock_search_2)
+
+    extract_calls = [0]
+    async def mock_extract_run(content: str, **kwargs):
+        class MockExtractResult:
+            def __init__(self, data):
+                self.output = DoctorExtractedData(**data)
+        if extract_calls[0] == 0:
+            extract_calls[0] += 1
+            # First extraction returns a valid degree but NO VALID COLLEGE NAME
+            return MockExtractResult({"colleges": [{"name": "not specified", "degree": "MBBS", "year": 2005}], "registrations": ["Mock Reg"]})
+        # Second extraction returns a VALID college
+        return MockExtractResult({"colleges": [{"name": "Mock Medical College", "degree": "MBBS", "year": 2005}], "registrations": ["Mock Reg"]})
+
+    async def mock_enrich_run(college_json: str, **kwargs):
+        class MockEnrichResult:
+            def __init__(self):
+                self.output = CollegeInfo(name="Mock Medical College", degree="MBBS", year=2005, is_government=True, is_private=False)
+        return MockEnrichResult()
+
+    import main
+    monkeypatch.setattr(main.search_agent, "run", mock_search_run)
+    monkeypatch.setattr(main.extraction_agent, "run", mock_extract_run)
+    monkeypatch.setattr(main.enrichment_agent, "run", mock_enrich_run)
+    
+    with client.websocket_connect("/ws/extract") as websocket:
+        websocket.send_json({"name": "Test Name", "hospital": "Test Hosp"})
+        
+        import time
+        start = time.time()
+        res1 = None
+        while True:
+            if time.time() - start > 5:
+                pytest.fail("Test timed out.")
+            msg = websocket.receive_json()
+            if msg["type"] == "search_result":
+                res1 = msg
+                break
+                
+        assert res1["data"]["source_platform"] == "Cloudnine Hospitals"
+        websocket.send_json({"action": "confirm"})
+        
+        start2 = time.time()
+        res2 = None
+        while True:
+            if time.time() - start2 > 5:
+                pytest.fail("Test timed out waiting for second search result.")
+            msg = websocket.receive_json()
+            if msg["type"] == "search_result":
+                res2 = msg
+                break
+                
+        assert res2["data"]["source_platform"] == "Practo"
+        websocket.send_json({"action": "confirm"})
+        
+        start3 = time.time()
+        final_data = None
+        while True:
+            if time.time() - start3 > 5:
+                pytest.fail("Test timed out waiting for final result.")
+            msg = websocket.receive_json()
+            if msg["type"] == "final_result":
+                final_data = msg["data"]
+                break
+                
+        assert final_data["source_platform"] == "Practo"
+        assert len(final_data["colleges"]) == 1
+        assert final_data["colleges"][0]["name"] == "Mock Medical College"

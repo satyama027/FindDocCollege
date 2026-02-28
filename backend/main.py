@@ -94,7 +94,8 @@ search_agent = Agent(
         "5. JustDial\n\n"
         "Use the `search_profile_url` tool to query the web. "
         "Analyze the search snippets to ensure the URL matches the doctor's identity. "
-        "If you find a matching URL, extract the doctor's name, specialty, the exact URL, and identify the `source_platform` (e.g., 'Practo', 'Apollo Hospitals', 'Lybrate')."
+        "If you find a matching URL, extract the doctor's name, specialty, the exact URL, and identify the `source_platform` (e.g., 'Practo', 'Apollo Hospitals', 'Lybrate').\n"
+        "Return the EXACT profile URL without any line breaks or spaces."
     )
 )
 
