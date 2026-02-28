@@ -8,9 +8,11 @@ from main import (
     search_agent, 
     extraction_agent, 
     enrichment_agent, 
+    consistency_agent,
     DoctorSearchResult, 
     DoctorExtractedData, 
     CollegeInfo,
+    ConsistencyResult,
     app
 )
 from fastapi.testclient import TestClient
@@ -287,7 +289,7 @@ async def test_jina_markdown_fetch(monkeypatch):
     )
     
     with search_agent.override(model=TestModel(custom_output_args=mock_search)):
-        with extraction_agent.override(model=TestModel(custom_output_args={"colleges":[{"name": "Mock College", "degree": "MBBS", "year": 2000}], "registrations":[]})):
+        with extraction_agent.override(model=TestModel(custom_output_args={"colleges":[{"name": "Mock College", "degree": "MBBS", "year": 2000}, {"name": "Mock 2", "degree": "MD", "year": 2008}], "registrations":[]})):
             with enrichment_agent.override(model=TestModel(custom_output_args={"name":"Mock College","degree":"MBBS","year":2000,"is_government":True,"is_private":False})):
                 
                 # Connect to the WebSocket
@@ -311,7 +313,11 @@ async def test_jina_markdown_fetch(monkeypatch):
                     # Receive diverse status messages (Jina Fetch, Extracting, Routing...)
                     # We loop until we get the final result or error
                     final_data = None
-                    for _ in range(10): 
+                    import time
+                    start_t = time.time()
+                    while True:
+                        if time.time() - start_t > 5:
+                            pytest.fail("Test timed out waiting for final result.")
                         msg = websocket.receive_json()
                         if msg["type"] == "final_result":
                             final_data = msg["data"]
@@ -321,7 +327,7 @@ async def test_jina_markdown_fetch(monkeypatch):
                             
                     assert final_data is not None
                     assert final_data["name"] == "Test Name"
-                    assert len(final_data["colleges"]) == 1
+                    assert len(final_data["colleges"]) == 2
                     assert final_data["colleges"][0]["name"] == "Mock College"
 
 
@@ -418,7 +424,7 @@ async def test_extraction_fallback_loop(monkeypatch):
         if extract_calls[0] == 0:
             extract_calls[0] += 1
             return MockExtractResult({"colleges": [], "registrations": []})
-        return MockExtractResult({"colleges": [{"name": "Mock College", "degree": "MBBS", "year": 2005}], "registrations": ["Mock Reg"]})
+        return MockExtractResult({"colleges": [{"name": "Mock College", "degree": "MBBS", "year": 2005}, {"name": "Mock 2", "degree": "MD", "year": 2008}], "registrations": ["Mock Reg"]})
 
     async def mock_enrich_run(college_json: str, **kwargs):
         class MockEnrichResult:
@@ -452,39 +458,22 @@ async def test_extraction_fallback_loop(monkeypatch):
         # 2. Confirm First Result -> Leads to 0 Colleges
         websocket.send_json({"action": "confirm"})
         
-        # Receive status messages until the loop triggers the SECOND search
+        # Receive status messages until the loop triggers the SECOND search and extracts automatically
         start2 = time.time()
-        res2 = None
-        while True:
-            if time.time() - start2 > 5:
-                pytest.fail("Test timed out waiting for second search result.")
-                
-            msg = websocket.receive_json()
-            if msg["type"] == "search_result":
-                res2 = msg
-                break
-            elif msg["type"] == "error" or msg["type"] == "final_result":
-                pytest.fail(f"Agent did not loop back to search phase. Error: {msg}")
-                
-        assert res2["data"]["source_platform"] == "Lybrate"
-        
-        # 3. Confirm Second Result -> Leads to 1 College (Success)
-        websocket.send_json({"action": "confirm"})
-        
-        start3 = time.time()
         final_data = None
         while True:
-            if time.time() - start3 > 5:
+            if time.time() - start2 > 5:
                 pytest.fail("Test timed out waiting for final result.")
+                
             msg = websocket.receive_json()
             if msg["type"] == "final_result":
                 final_data = msg["data"]
                 break
             elif msg["type"] == "error":
-                pytest.fail(f"Agent errored during second extraction. {msg}")
+                pytest.fail(f"Agent errored. {msg}")
                 
-        assert final_data["source_platform"] == "Lybrate"
-        assert len(final_data["colleges"]) == 1
+        assert final_data["source_platform"] == "JustDial"
+        assert len(final_data["colleges"]) == 2
 
 # ----------------------------------------------------------------------------
 # Test 8: Extraction Fallback for Poor Quality Data (No valid institution name)
@@ -546,7 +535,7 @@ async def test_extraction_fallback_quality_check(monkeypatch):
             # First extraction returns a valid degree but NO VALID COLLEGE NAME
             return MockExtractResult({"colleges": [{"name": "not specified", "degree": "MBBS", "year": 2005}], "registrations": ["Mock Reg"]})
         # Second extraction returns a VALID college
-        return MockExtractResult({"colleges": [{"name": "Mock Medical College", "degree": "MBBS", "year": 2005}], "registrations": ["Mock Reg"]})
+        return MockExtractResult({"colleges": [{"name": "Mock Medical College", "degree": "MBBS", "year": 2005}, {"name": "Mock 2", "degree": "MD", "year": 2008}], "registrations": ["Mock Reg"]})
 
     async def mock_enrich_run(college_json: str, **kwargs):
         class MockEnrichResult:
@@ -577,30 +566,19 @@ async def test_extraction_fallback_quality_check(monkeypatch):
         websocket.send_json({"action": "confirm"})
         
         start2 = time.time()
-        res2 = None
-        while True:
-            if time.time() - start2 > 5:
-                pytest.fail("Test timed out waiting for second search result.")
-            msg = websocket.receive_json()
-            if msg["type"] == "search_result":
-                res2 = msg
-                break
-                
-        assert res2["data"]["source_platform"] == "Practo"
-        websocket.send_json({"action": "confirm"})
-        
-        start3 = time.time()
         final_data = None
         while True:
-            if time.time() - start3 > 5:
+            if time.time() - start2 > 5:
                 pytest.fail("Test timed out waiting for final result.")
             msg = websocket.receive_json()
             if msg["type"] == "final_result":
                 final_data = msg["data"]
                 break
+            elif msg["type"] == "error":
+                pytest.fail(f"Agent errored. {msg}")
                 
-        assert final_data["source_platform"] == "Practo"
-        assert len(final_data["colleges"]) == 1
+        assert final_data["source_platform"] == "Cloudnine Hospitals"
+        assert len(final_data["colleges"]) == 2
         assert final_data["colleges"][0]["name"] == "Mock Medical College"
 
 # ----------------------------------------------------------------------------
@@ -657,7 +635,7 @@ async def test_retry_malformed_url(monkeypatch):
         if extract_calls[0] == 0:
             extract_calls[0] += 1
             return MockExtractResult({"colleges": [], "registrations": []})
-        return MockExtractResult({"colleges": [{"name": "Mock Medical College", "degree": "MBBS", "year": 2005}], "registrations": ["Mock Reg"]})
+        return MockExtractResult({"colleges": [{"name": "Mock Medical College", "degree": "MBBS", "year": 2005}, {"name": "Mock 2", "degree": "MD", "year": 2008}], "registrations": ["Mock Reg"]})
 
     async def mock_enrich_run(college_json: str, **kwargs):
         class MockEnrichResult:
@@ -682,31 +660,20 @@ async def test_retry_malformed_url(monkeypatch):
         assert res1["data"]["profile_url"] == "https://practo.com/malformed"
         websocket.send_json({"action": "confirm"})
         
-        # 2. Key Assertion: Expect Status message indicating a Retry, followed by the second search result
+        # 2. Key Assertion: Expect Status message indicating a Retry, followed by final result
         retry_detected = False
-        res2 = None
+        final_data = None
         while True:
             msg = websocket.receive_json()
             if msg["type"] == "status" and "Retrying" in msg["message"]:
                 retry_detected = True
-            elif msg["type"] == "search_result":
-                res2 = msg
-                break
-                
-        assert retry_detected is True, "The system completely skipped the URL Retry logic!"
-        assert res2["data"]["profile_url"] == "https://practo.com/fixed", "System did not fetch the fixed Retry URL"
-        websocket.send_json({"action": "confirm"})
-        
-        # 3. Final Verification
-        final_data = None
-        while True:
-            msg = websocket.receive_json()
-            if msg["type"] == "final_result":
+            elif msg["type"] == "final_result":
                 final_data = msg["data"]
                 break
                 
+        assert retry_detected is True, "The system completely skipped the URL Retry logic!"
         assert final_data["source_platform"] == "Practo"
-        assert len(final_data["colleges"]) == 1
+        assert len(final_data["colleges"]) == 2
 
 # ----------------------------------------------------------------------------
 # Test 10: Retry Logic - Rejection after Retries Exhausted
@@ -752,7 +719,7 @@ async def test_rejection_after_retries_exhausted(monkeypatch):
         if extract_calls[0] < 2:
             extract_calls[0] += 1
             return MockExtractResult({"colleges": [], "registrations": []})
-        return MockExtractResult({"colleges": [{"name": "Mock Medical College", "degree": "MBBS", "year": 2005}], "registrations": ["Mock Reg"]})
+        return MockExtractResult({"colleges": [{"name": "Mock Medical College", "degree": "MBBS", "year": 2005}, {"name": "Mock 2", "degree": "MD", "year": 2008}], "registrations": ["Mock Reg"]})
 
     async def mock_enrich_run(college_json: str, **kwargs):
         class MockEnrichResult:
@@ -772,32 +739,483 @@ async def test_rejection_after_retries_exhausted(monkeypatch):
             if websocket.receive_json()["type"] == "search_result": break
         websocket.send_json({"action": "confirm"})
         
-        # 2. Second Attempt (Retry - Practo Bad 2)
-        while True:
-            if websocket.receive_json()["type"] == "search_result": break
-        websocket.send_json({"action": "confirm"})
+        # 2. Second Attempt (Retry - Practo Bad 2) is automatically scraped in background.
         
         # 3. Third Attempt (Lybrate - Good) and verify rejection triggered
         rejection_detected = False
-        res3 = None
+        final_data = None
         while True:
             msg = websocket.receive_json()
             if msg["type"] == "status" and ("Retries exhausted" in msg["message"] or "exhausted" in msg["message"]):
                 rejection_detected = True
-            if msg["type"] == "search_result":
-                res3 = msg
-                break
-                
-        assert rejection_detected is True, "System did not emit standard rejection message after retries failed."
-        assert res3["data"]["source_platform"] == "Lybrate"
-        websocket.send_json({"action": "confirm"})
-        
-        # 4. Final Verification
-        final_data = None
-        while True:
-            msg = websocket.receive_json()
-            if msg["type"] == "final_result":
+            elif msg["type"] == "final_result":
                 final_data = msg["data"]
                 break
                 
-        assert final_data["source_platform"] == "Lybrate"
+        assert rejection_detected is True, "System did not emit standard rejection message after retries failed."
+        assert final_data["source_platform"] == "Practo"
+        assert len(final_data["colleges"]) == 2
+
+
+# ============================================================================
+# PHASE 4: MULTI-URL AGGREGATION TESTS (TDD)
+# ============================================================================
+
+# Test 11: Combine information from multiple sources (Dr. Abhishek Bansal)
+@pytest.mark.asyncio
+async def test_aggregation_combines_sources_abhishek_bansal(monkeypatch):
+    """Verify system combines MBBS from URL 1 and MD from URL 2 for Abhishek Bansal."""
+    
+    import httpx
+    class MockResponse:
+        status_code = 200
+        text = "# Mock Markdown"
+    class MockClient:
+        async def __aenter__(self): return self
+        async def __aexit__(self, exc_type, exc_val, exc_tb): pass
+        async def get(self, url, timeout): return MockResponse()
+    monkeypatch.setattr(httpx, "AsyncClient", MockClient)
+    client = TestClient(app)
+    
+    mock_search_1 = DoctorSearchResult(profile_url="https://practo.com/abhishek", source_platform="Practo", found_name="Abhishek Bansal", found_specialty="Pediatrician", confidence_reasoning="")
+    mock_search_2 = DoctorSearchResult(profile_url="https://lybrate.com/abhishek", source_platform="Lybrate", found_name="Abhishek Bansal", found_specialty="Pediatrician", confidence_reasoning="")
+    
+    search_calls = [0]
+    async def mock_search_run(prompt: str, **kwargs):
+        class MockRunResult:
+            def __init__(self, data): self.output = data
+        search_calls[0] += 1
+        return MockRunResult(mock_search_1 if search_calls[0] == 1 else mock_search_2)
+
+    extract_calls = [0]
+    async def mock_extract_run(content: str, **kwargs):
+        class MockExtractResult:
+            def __init__(self, data): self.output = DoctorExtractedData(**data)
+        extract_calls[0] += 1
+        if extract_calls[0] == 1:
+            return MockExtractResult({"colleges": [{"name": "AIIMS", "degree": "MBBS", "year": 2010}], "registrations": []})
+        return MockExtractResult({"colleges": [{"name": "PGI", "degree": "MD", "year": 2015}], "registrations": []})
+
+    async def mock_enrich_run(college_json: str, **kwargs):
+        class MockEnrichResult:
+            def __init__(self, data): self.output = data
+        import json
+        c = json.loads(college_json)
+        return MockEnrichResult(CollegeInfo(name=c["name"], degree=c["degree"], year=c["year"], is_government=True, is_private=False))
+
+    async def mock_consistency_run(prompt: str, **kwargs):
+        class MockConsistencyResult:
+            def __init__(self): self.output = ConsistencyResult(is_same_doctor=True, confidence_reasoning="Matches")
+        return MockConsistencyResult()
+
+    import main
+    monkeypatch.setattr(main.search_agent, "run", mock_search_run)
+    monkeypatch.setattr(main.extraction_agent, "run", mock_extract_run)
+    monkeypatch.setattr(main.enrichment_agent, "run", mock_enrich_run)
+    monkeypatch.setattr(main.consistency_agent, "run", mock_consistency_run)
+    
+    with client.websocket_connect("/ws/extract") as websocket:
+        websocket.send_json({"name": "Abhishek Bansal", "hospital": "Lucknow Hosp"})
+        
+        while True:
+            msg = websocket.receive_json()
+            print("STAGE 1 msg:", msg)
+            if msg["type"] == "search_result": break
+        websocket.send_json({"action": "confirm"})
+        
+        final_data = None
+        while True:
+            msg = websocket.receive_json()
+            print("STAGE 2 msg:", msg)
+            if msg["type"] == "final_result":
+                final_data = msg["data"]
+                break
+            if msg["type"] == "error":
+                pytest.fail(f"Received error: {msg['message']}")
+        assert len(final_data["colleges"]) == 2
+        degrees = [c["degree"] for c in final_data["colleges"]]
+        assert "MBBS" in degrees and "MD" in degrees
+        assert search_calls[0] == 2 # Proves it didn't stop at URL 1
+
+# Test 12: Stops immediately after finding 2 degrees
+@pytest.mark.asyncio
+async def test_aggregation_stops_at_two_degrees(monkeypatch):
+    import httpx
+    class MockClient:
+        async def __aenter__(self): return self
+        async def __aexit__(self, exc_type, exc_val, exc_tb): pass
+        async def get(self, url, timeout):
+            class MockResponse:
+                status_code = 200
+                text = "Mock Content"
+            return MockResponse()
+    monkeypatch.setattr(httpx, "AsyncClient", MockClient)
+    client = TestClient(app)
+    
+    search_calls = [0]
+    async def mock_search_run(*args, **kwargs):
+        search_calls[0] += 1
+        class MockRunResult:
+            def __init__(self): self.output = DoctorSearchResult(profile_url=f"http://x-{search_calls[0]}", source_platform="X", found_name="X", found_specialty="X", confidence_reasoning="")
+        return MockRunResult()
+
+    async def mock_extract_run(*args, **kwargs):
+        class MockExtractResult:
+            def __init__(self): self.output = DoctorExtractedData(colleges=[
+                {"name": "Coll1", "degree": "MBBS", "year": 2000},
+                {"name": "Coll2", "degree": "MD", "year": 2005}
+            ], registrations=[])
+        return MockExtractResult()
+
+    async def mock_enrich_run(college_json, **kwargs):
+        import json
+        c = json.loads(college_json)
+        class MockEnrichResult:
+            def __init__(self): self.output = CollegeInfo(name=c["name"], degree=c["degree"], year=c.get("year"), is_government=True, is_private=False)
+        return MockEnrichResult()
+
+    import main
+    monkeypatch.setattr(main.search_agent, "run", mock_search_run)
+    monkeypatch.setattr(main.extraction_agent, "run", mock_extract_run)
+    monkeypatch.setattr(main.enrichment_agent, "run", mock_enrich_run)
+    
+    with client.websocket_connect("/ws/extract") as websocket:
+        websocket.send_json({"name": "Test", "hospital": "Test"})
+        while True:
+            if websocket.receive_json()["type"] == "search_result": break
+        websocket.send_json({"action": "confirm"})
+        while True:
+            msg = websocket.receive_json()
+            if msg["type"] == "final_result": break
+            if msg["type"] == "error":
+                pytest.fail(f"Received error: {msg['message']}")
+        assert search_calls[0] == 1 # Shouldn't search a second URL because first URL had 2 degrees
+
+# Test 13: Filters inconsistent doctors
+@pytest.mark.asyncio
+async def test_aggregation_filters_inconsistent_doctors(monkeypatch):
+    import httpx
+    class MockClient:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): pass
+        async def get(self, *args, **kwargs):
+            class MockResponse:
+                status_code = 200
+                text = "Mock Content"
+            return MockResponse()
+    monkeypatch.setattr(httpx, "AsyncClient", MockClient)
+    client = TestClient(app)
+    
+    search_calls = [0]
+    async def mock_search_run(*args, **kwargs):
+        search_calls[0] += 1
+        class MockRunResult:
+            def __init__(self): self.output = DoctorSearchResult(profile_url=f"http://x-{search_calls[0]}", source_platform="X", found_name="X", found_specialty="X", confidence_reasoning="")
+        return MockRunResult()
+
+    extract_calls = [0]
+    async def mock_extract_run(*args, **kwargs):
+        class MockExtractResult:
+            def __init__(self, data): self.output = DoctorExtractedData(**data)
+        extract_calls[0] += 1
+        if extract_calls[0] == 1:
+            return MockExtractResult({"colleges": [{"name": "AIIMS", "degree": "MBBS"}], "registrations": []})
+        # URL 2 has MD, but we'll mock consistency to reject it
+        return MockExtractResult({"colleges": [{"name": "PGI", "degree": "MD"}], "registrations": []})
+
+    async def mock_consistency_run(*args, **kwargs):
+        class MockConsistencyResult:
+            def __init__(self): self.output = ConsistencyResult(is_same_doctor=False, confidence_reasoning="Different city")
+        return MockConsistencyResult()
+
+    async def mock_enrich_run(*args, **kwargs):
+        class MockEnrichResult:
+            def __init__(self): self.output = CollegeInfo(name="AIIMS", degree="MBBS", year=2000, is_government=True, is_private=False)
+        return MockEnrichResult()
+
+    import main
+    monkeypatch.setattr(main.search_agent, "run", mock_search_run)
+    monkeypatch.setattr(main.extraction_agent, "run", mock_extract_run)
+    monkeypatch.setattr(main.enrichment_agent, "run", mock_enrich_run)
+    monkeypatch.setattr(main.consistency_agent, "run", mock_consistency_run)
+    
+    with client.websocket_connect("/ws/extract") as websocket:
+        websocket.send_json({"name": "Test", "hospital": "Test"})
+        while True:
+            if websocket.receive_json()["type"] == "search_result": break
+        websocket.send_json({"action": "confirm"})
+        
+        final_data = None
+        while True:
+            msg = websocket.receive_json()
+            if msg["type"] == "final_result": 
+                final_data = msg["data"]
+                break
+            if msg["type"] == "error":
+                pytest.fail(f"Received error: {msg['message']}")
+            
+        assert len(final_data["colleges"]) == 1
+        assert final_data["colleges"][0]["degree"] == "MBBS" # The MD was rejected due to inconsistency
+
+# Test 14: Deduplicates degrees (keeps first)
+@pytest.mark.asyncio
+async def test_aggregation_deduplicates_degrees(monkeypatch):
+    import httpx
+    class MockClient:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): pass
+        async def get(self, *args, **kwargs):
+            class MockResponse:
+                status_code = 200
+                text = "Mock Content"
+            return MockResponse()
+    monkeypatch.setattr(httpx, "AsyncClient", MockClient)
+    client = TestClient(app)
+    
+    search_calls = [0]
+    async def mock_search_run(*args, **kwargs):
+        search_calls[0] += 1
+        class MockRunResult:
+            def __init__(self): self.output = DoctorSearchResult(profile_url=f"http://x-{search_calls[0]}", source_platform="X", found_name="X", found_specialty="X", confidence_reasoning="")
+        return MockRunResult()
+
+    extract_calls = [0]
+    async def mock_extract_run(*args, **kwargs):
+        class MockExtractResult:
+            def __init__(self, data): self.output = DoctorExtractedData(**data)
+        extract_calls[0] += 1
+        if extract_calls[0] == 1:
+            return MockExtractResult({"colleges": [{"name": "AIIMS", "degree": "MBBS"}], "registrations": []})
+        # URL 2 has another MBBS and an MD
+        return MockExtractResult({"colleges": [{"name": "MAMC", "degree": "MBBS"}, {"name": "PGI", "degree": "MD"}], "registrations": []})
+
+    async def mock_consistency_run(*args, **kwargs):
+        class MockConsistencyResult:
+            def __init__(self): self.output = ConsistencyResult(is_same_doctor=True, confidence_reasoning="")
+        return MockConsistencyResult()
+
+    async def mock_enrich_run(college_json, **kwargs):
+        import json
+        c = json.loads(college_json)
+        class MockEnrichResult:
+            def __init__(self): self.output = CollegeInfo(name=c["name"], degree=c["degree"], year=2000, is_government=True, is_private=False)
+        return MockEnrichResult()
+
+    import main
+    monkeypatch.setattr(main.search_agent, "run", mock_search_run)
+    monkeypatch.setattr(main.extraction_agent, "run", mock_extract_run)
+    monkeypatch.setattr(main.enrichment_agent, "run", mock_enrich_run)
+    monkeypatch.setattr(main.consistency_agent, "run", mock_consistency_run)
+    
+    with client.websocket_connect("/ws/extract") as websocket:
+        websocket.send_json({"name": "Test", "hospital": "Test"})
+        while True:
+            if websocket.receive_json()["type"] == "search_result": break
+        websocket.send_json({"action": "confirm"})
+        final_data = None
+        while True:
+            msg = websocket.receive_json()
+            if msg["type"] == "final_result": 
+                final_data = msg["data"]
+                break
+            if msg["type"] == "error": break
+        
+        assert len(final_data["colleges"]) == 2
+        degrees = [c["degree"] for c in final_data["colleges"]]
+        names = [c["name"] for c in final_data["colleges"]]
+        assert "MBBS" in degrees and "MD" in degrees
+        assert "AIIMS" in names
+        assert "MAMC" not in names # Kept the first MBBS
+
+# Test 15: Ignores empty results silently
+@pytest.mark.asyncio
+async def test_aggregation_ignores_empty_results(monkeypatch):
+    import httpx
+    class MockClient:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): pass
+        async def get(self, *args, **kwargs):
+            class MockResponse:
+                status_code = 200
+                text = "Mock Content"
+            return MockResponse()
+    monkeypatch.setattr(httpx, "AsyncClient", MockClient)
+    client = TestClient(app)
+    
+    search_calls = [0]
+    async def mock_search_run(*args, **kwargs):
+        search_calls[0] += 1
+        class MockRunResult:
+            def __init__(self): self.output = DoctorSearchResult(profile_url=f"http://x-{search_calls[0]}", source_platform="X", found_name="X", found_specialty="X", confidence_reasoning="")
+        return MockRunResult()
+
+    extract_calls = [0]
+    async def mock_extract_run(*args, **kwargs):
+        class MockExtractResult:
+            def __init__(self, data): self.output = DoctorExtractedData(**data)
+        extract_calls[0] += 1
+        if extract_calls[0] == 1:
+            return MockExtractResult({"colleges": [{"name": "AIIMS", "degree": "MBBS"}], "registrations": []})
+        if extract_calls[0] == 2:
+            return MockExtractResult({"colleges": [], "registrations": []}) # empty
+        return MockExtractResult({"colleges": [{"name": "PGI", "degree": "MD"}], "registrations": []})
+
+    async def mock_consistency_run(*args, **kwargs):
+        class MockConsistencyResult:
+            def __init__(self): self.output = ConsistencyResult(is_same_doctor=True, confidence_reasoning="")
+        return MockConsistencyResult()
+
+    async def mock_enrich_run(college_json, **kwargs):
+        import json
+        c = json.loads(college_json)
+        class MockEnrichResult:
+            def __init__(self): self.output = CollegeInfo(name=c["name"], degree=c["degree"], year=2000, is_government=True, is_private=False)
+        return MockEnrichResult()
+
+    import main
+    monkeypatch.setattr(main.search_agent, "run", mock_search_run)
+    monkeypatch.setattr(main.extraction_agent, "run", mock_extract_run)
+    monkeypatch.setattr(main.enrichment_agent, "run", mock_enrich_run)
+    monkeypatch.setattr(main.consistency_agent, "run", mock_consistency_run)
+    
+    with client.websocket_connect("/ws/extract") as websocket:
+        websocket.send_json({"name": "Test", "hospital": "Test"})
+        while True:
+            if websocket.receive_json()["type"] == "search_result": break
+        websocket.send_json({"action": "confirm"})
+        final_data = None
+        while True:
+            msg = websocket.receive_json()
+            if msg["type"] == "final_result": 
+                final_data = msg["data"]
+                break
+            if msg["type"] == "error": break
+        
+        assert len(final_data["colleges"]) == 2
+        assert extract_calls[0] == 3 # Proves it skipped 2 and moved to 3
+
+# Test 16: Stops at URL limit 10
+@pytest.mark.asyncio
+async def test_aggregation_stops_at_URL_limit(monkeypatch):
+    import httpx
+    class MockClient:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): pass
+        async def get(self, *args, **kwargs):
+            class MockResponse:
+                status_code = 200
+                text = "Mock Content"
+            return MockResponse()
+    monkeypatch.setattr(httpx, "AsyncClient", MockClient)
+    client = TestClient(app)
+    
+    search_calls = [0]
+    async def mock_search_run(*args, **kwargs):
+        search_calls[0] += 1
+        class MockRunResult:
+            def __init__(self): self.output = DoctorSearchResult(profile_url=f"http://x-{search_calls[0]}", source_platform="X", found_name="X", found_specialty="X", confidence_reasoning="")
+        return MockRunResult()
+
+    async def mock_extract_run(*args, **kwargs):
+        class MockExtractResult:
+            def __init__(self): self.output = DoctorExtractedData(colleges=[{"name": "AIIMS", "degree": "MBBS"}], registrations=[])
+        return MockExtractResult() # Never returns an MD, so it loops until limit
+
+    async def mock_consistency_run(*args, **kwargs):
+        class MockConsistencyResult:
+            def __init__(self): self.output = ConsistencyResult(is_same_doctor=True, confidence_reasoning="")
+        return MockConsistencyResult()
+
+    async def mock_enrich_run(college_json, **kwargs):
+        class MockEnrichResult:
+            def __init__(self): self.output = CollegeInfo(name="AIIMS", degree="MBBS", year=2000, is_government=True, is_private=False)
+        return MockEnrichResult()
+
+    import main
+    monkeypatch.setattr(main.search_agent, "run", mock_search_run)
+    monkeypatch.setattr(main.extraction_agent, "run", mock_extract_run)
+    monkeypatch.setattr(main.enrichment_agent, "run", mock_enrich_run)
+    monkeypatch.setattr(main.consistency_agent, "run", mock_consistency_run)
+    
+    with client.websocket_connect("/ws/extract") as websocket:
+        websocket.send_json({"name": "Test", "hospital": "Test"})
+        while True:
+            if websocket.receive_json()["type"] == "search_result": break
+        websocket.send_json({"action": "confirm"})
+        final_data = None
+        while True:
+            msg = websocket.receive_json()
+            if msg["type"] == "final_result": 
+                final_data = msg["data"]
+                break
+            if msg["type"] == "error": break
+        
+        assert len(final_data["colleges"]) == 1 # Only got MBBS
+        assert search_calls[0] >= 10 # Hit the hard limit
+
+# Test 17: Handles extraction exception
+@pytest.mark.asyncio
+async def test_aggregation_handles_extraction_errors(monkeypatch):
+    import httpx
+    class MockClient:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): pass
+        async def get(self, *args, **kwargs):
+            class MockResponse:
+                status_code = 200
+                text = "Mock Content"
+            return MockResponse()
+    monkeypatch.setattr(httpx, "AsyncClient", MockClient)
+    client = TestClient(app)
+    
+    search_calls = [0]
+    async def mock_search_run(*args, **kwargs):
+        search_calls[0] += 1
+        class MockRunResult:
+            def __init__(self): self.output = DoctorSearchResult(profile_url=f"http://x-{search_calls[0]}", source_platform="X", found_name="X", found_specialty="X", confidence_reasoning="")
+        return MockRunResult()
+
+    extract_calls = [0]
+    async def mock_extract_run(*args, **kwargs):
+        class MockExtractResult:
+            def __init__(self, data): self.output = DoctorExtractedData(**data)
+        extract_calls[0] += 1
+        if extract_calls[0] == 1:
+            return MockExtractResult({"colleges": [{"name": "AIIMS", "degree": "MBBS"}], "registrations": []})
+        if extract_calls[0] == 2:
+            raise Exception("Mock timeout/crash")
+        return MockExtractResult({"colleges": [{"name": "PGI", "degree": "MD"}], "registrations": []})
+
+    async def mock_consistency_run(*args, **kwargs):
+        class MockConsistencyResult:
+            def __init__(self): self.output = ConsistencyResult(is_same_doctor=True, confidence_reasoning="")
+        return MockConsistencyResult()
+
+    async def mock_enrich_run(college_json, **kwargs):
+        import json
+        c = json.loads(college_json)
+        class MockEnrichResult:
+            def __init__(self): self.output = CollegeInfo(name=c["name"], degree=c["degree"], year=2000, is_government=True, is_private=False)
+        return MockEnrichResult()
+
+    import main
+    monkeypatch.setattr(main.search_agent, "run", mock_search_run)
+    monkeypatch.setattr(main.extraction_agent, "run", mock_extract_run)
+    monkeypatch.setattr(main.enrichment_agent, "run", mock_enrich_run)
+    monkeypatch.setattr(main.consistency_agent, "run", mock_consistency_run)
+    
+    with client.websocket_connect("/ws/extract") as websocket:
+        websocket.send_json({"name": "Test", "hospital": "Test"})
+        while True:
+            if websocket.receive_json()["type"] == "search_result": break
+        websocket.send_json({"action": "confirm"})
+        final_data = None
+        while True:
+            msg = websocket.receive_json()
+            if msg["type"] == "final_result": 
+                final_data = msg["data"]
+                break
+            if msg["type"] == "error": break
+        
+        assert len(final_data["colleges"]) == 2
+        assert extract_calls[0] == 3

@@ -59,6 +59,10 @@ class DoctorExtractedData(BaseModel):
     colleges: List[ExtractedCollege] = Field(default_factory=list, description="List of colleges where the doctor studied, including degree and year.")
     registrations: List[str] = Field(default_factory=list, description="Registration details, such as registration number and medical council.")
 
+class ConsistencyResult(BaseModel):
+    is_same_doctor: bool = Field(description="True if both profiles definitively refer to the same individual doctor.")
+    confidence_reasoning: str = Field(description="Explanation of why these profiles match or do not match based on name, specialty, city, and hospital.")
+
 class CollegeInfo(BaseModel):
     name: str = Field(description="Name of the college or university")
     degree: Optional[str] = Field(default=None, description="The degree obtained")
@@ -86,8 +90,9 @@ search_agent = Agent(
     system_prompt=(
         "You are an expert search assistant. Your goal is to find a reliable online profile URL "
         "for a specific medical doctor based on the user's provided name and hospital.\n\n"
-        "You must prioritize sources in this exact order:\n"
-        "1. Practo\n"
+        "⭐ CRITICAL PRIORITY: You MUST always prioritize finding and returning a Practo (practo.com) profile FIRST.\n"
+        "Even if the user explicitly names a specific hospital (like Cloudnine or Apollo), you MUST still search for and prefer the doctor's Practo profile over the hospital's official website.\n\n"
+        "Fallback sources, in exact order, if and ONLY if a Practo profile cannot be found:\n"
         "2. The specific Hospital's official website (e.g., Apollo, Fortis, Manipal)\n"
         "3. Lybrate\n"
         "4. State Medical Council (SMC) directories or National Medical Register (NMR) indexers\n"
@@ -157,6 +162,16 @@ async def search_college_type(ctx: RunContext[None], college_data: str) -> str:
     except Exception as e:
         return f"Error searching: {e}"
 
+# 4. Consistency Agent
+consistency_agent = Agent(
+    MODEL,
+    output_type=ConsistencyResult,
+    system_prompt=(
+        "You are a medical data verification assistant. You will be given metadata from a primary, confirmed doctor profile "
+        "and metadata from a newly scraped profile. Your job is to determine if both profiles refer to the EXACT SAME human being "
+        "by comparing their names, specialties, cities, and hospital affiliations."
+    )
+)
 # ---------------------------------------------------------
 # Application Flow: FastAPI WebSocket Endpoint
 # ---------------------------------------------------------
@@ -189,27 +204,38 @@ async def extract_doctor_data(websocket: WebSocket):
             await websocket.close()
             return
             
-        profile_url = None
-        source_platform = None
+        # Track global aggregation state
+        aggregated_colleges = []
+        extracted_degrees = set()
+        total_urls_checked = 0
+        max_urls = 10
+        registrations = []
         tried_urls = []
         platform_retries = {}
         
-        # Outer Loop: If extraction fails or finds 0 colleges, we come back here to find a NEW profile
-        while True:
-            # Loop for Search & Confirm
+        primary_source_platform = None
+        primary_url_confirmed = False
+        
+        while total_urls_checked < max_urls and len(extracted_degrees) < 2:
+            # -------------------------------------------------------------
+            # Stage 1: Search & Confirm
+            # -------------------------------------------------------------
             while True:
-                await websocket.send_json({"type": "status", "message": f"Searching multiple sources for {name}..."})
-                
+                if not primary_url_confirmed:
+                    await websocket.send_json({"type": "status", "message": f"Searching primary source for {name}..."})
+                else:
+                    await websocket.send_json({"type": "status", "message": f"Searching background source #{total_urls_checked + 1} for missing education details..."})
+                    
                 # Check if we are retrying a specific platform
-                if source_platform and platform_retries.get(source_platform, 0) == 1:
-                    prompt = f"The URL you provided for {source_platform} returned no educational data. Please search again and provide a CORRECTED URL for {source_platform}, or a different profile link on the same site for {name} at {hospital}."
+                if not primary_url_confirmed and primary_source_platform and platform_retries.get(primary_source_platform, 0) == 1:
+                    prompt = f"The URL you provided for {primary_source_platform} returned no educational data. Please search again and provide a CORRECTED URL for {primary_source_platform}, or a different profile link on the same site for {name} at {hospital}."
+                elif primary_url_confirmed and source_platform and platform_retries.get(source_platform, 0) == 1:
+                    prompt = f"The URL you provided for {source_platform} returned no educational data. Please search again and provide a CORRECTED URL..."
                 else:
                     prompt = f"Find a profile URL for Doctor Name: {name}, Hospital: {hospital}."
                     
                 if additional_context:
                     prompt += f" Additional Context: {additional_context}"
-                
-                # Instruct the agent to ignore profiles that previously yielded 0 colleges
                 if tried_urls:
                     prompt += f" DO NOT return any of these URLs: {', '.join(tried_urls)}"
                     
@@ -218,66 +244,92 @@ async def extract_doctor_data(websocket: WebSocket):
                     search_data = result.output
                     
                     if not search_data.profile_url:
-                         await websocket.send_json({
-                             "type": "search_failed", 
-                             "reasoning": search_data.confidence_reasoning
-                         })
-                         
-                         # Wait for refined context from user
-                         resp = await websocket.receive_text()
-                         resp_payload = json.loads(resp)
-                         
-                         if resp_payload.get("action") == "abort":
-                             return
-                             
-                         additional_context = resp_payload.get("additional_context")
+                        if not primary_url_confirmed:
+                             await websocket.send_json({"type": "search_failed", "reasoning": search_data.confidence_reasoning})
+                             resp = await websocket.receive_text()
+                             resp_payload = json.loads(resp)
+                             if resp_payload.get("action") == "abort": return
+                             additional_context = resp_payload.get("additional_context")
+                             continue
+                        else:
+                             # If we can't find anything else in the background, break out and enrich what we have
+                             break
                     else:
-                         # Sanitize the URL in case the LLM hallucinated newlines or spaces
                          search_data.profile_url = search_data.profile_url.strip().replace(' ', '').replace('\n', '').replace('\r', '')
                          
-                         await websocket.send_json({
-                             "type": "search_result",
-                             "data": search_data.model_dump()
-                         })
-                         
-                         # Wait for user confirmation
-                         resp = await websocket.receive_text()
-                         resp_payload = json.loads(resp)
-                         
-                         if resp_payload.get("action") == "confirm":
+                         if search_data.profile_url in tried_urls:
+                             continue # Force LLM to generate a new URL instead of failing or alerting the user
+                             
+                         if not primary_url_confirmed:
+                             # Ask user for manual confirmation ONLY until we have established a primary profile
+                             await websocket.send_json({"type": "search_result", "data": search_data.model_dump()})
+                             resp = await websocket.receive_text()
+                             resp_payload = json.loads(resp)
+                             if resp_payload.get("action") == "confirm":
+                                 profile_url = search_data.profile_url
+                                 source_platform = search_data.source_platform
+                                 primary_source_platform = source_platform
+                                 primary_url_confirmed = True
+                                 break
+                             elif resp_payload.get("action") == "refine":
+                                 additional_context = resp_payload.get("additional_context")
+                                 continue
+                             else:
+                                 return # Aborted
+                         else:
+                             # Background search automatically proceeds
                              profile_url = search_data.profile_url
                              source_platform = search_data.source_platform
                              break
-                         elif resp_payload.get("action") == "refine":
-                             additional_context = resp_payload.get("additional_context")
-                         else:
-                             return # Aborted
                              
                 except Exception as e:
-                    await websocket.send_json({"type": "error", "message": f"Search agent failed: {str(e)}"})
-                    return
-
-            # Stage 2: Scrape & Extract
-            await websocket.send_json({"type": "status", "message": f"Fetching markdown from {source_platform} via Jina..."})
+                    if not primary_url_confirmed:
+                        await websocket.send_json({"type": "error", "message": f"Search agent failed: {str(e)}"})
+                        return
+                    else:
+                        break # Give up on background search if search agent errors
+                        
+            # If we broke out of the search loop because we can't find more URLs
+            if not profile_url or profile_url in tried_urls:
+                break
+                
+            tried_urls.append(profile_url)
+            total_urls_checked += 1
             
+            # -------------------------------------------------------------
+            # Stage 2: Scrape & Verify Consistency
+            # -------------------------------------------------------------
+            await websocket.send_json({"type": "status", "message": f"Fetching markdown from {source_platform} via Jina..."})
             try:
                 async with httpx.AsyncClient() as client:
                     jina_url = f"https://r.jina.ai/{profile_url}"
                     response = await client.get(jina_url, timeout=30.0)
-                    
                     if response.status_code != 200:
-                        await websocket.send_json({"type": "error", "message": f"Failed to get markdown content. Status code: {response.status_code}"})
-                        return
+                        continue # Silently fail background scrape
                     markdown_content = response.text
-                    
                 if not markdown_content:
-                    await websocket.send_json({"type": "error", "message": "Scraped markdown content is empty."})
-                    return
+                    continue # Silently fail if empty
                     
-                await websocket.send_json({"type": "status", "message": "Analyzing profile with Gemini..."})
+                # Consistency Check (Only against established primary profiles, i.e., URLs > 1 AND valid colleges found)
+                if aggregated_colleges:
+                    await websocket.send_json({"type": "status", "message": f"Verifying {source_platform} profile consistency..."})
+                    primary_context = f"Doctor: {name}, Hospital: {hospital}, Source: {primary_source_platform}"
+                    new_context = f"New Scraped URL: {profile_url}, Content Preview: {markdown_content[:2000]}"
+                    consistency_prompt = f"Primary Profile Metadata:\n{primary_context}\n\nNew Profile Data:\n{new_context}"
+                    
+                    consistency = await consistency_agent.run(consistency_prompt)
+                    if not consistency.output.is_same_doctor:
+                        await websocket.send_json({"type": "status", "message": f"Skipping {source_platform}: Identified as a different doctor."})
+                        continue
+                        
+                # -------------------------------------------------------------
+                # Stage 3: Extract & Deduplicate
+                # -------------------------------------------------------------
+                await websocket.send_json({"type": "status", "message": f"Extracting education from {source_platform}..."})
                 extract_result = await extraction_agent.run(markdown_content)
                 extracted_data = extract_result.output
                 
+                # Handling empty extraction and Retry Logic
                 if not extracted_data.colleges:
                     if platform_retries.get(source_platform, 0) < 1:
                         platform_retries[source_platform] = platform_retries.get(source_platform, 0) + 1
@@ -285,14 +337,13 @@ async def extract_doctor_data(websocket: WebSocket):
                         continue
                     else:
                         await websocket.send_json({"type": "status", "message": f"Retries exhausted. No educational data found on {source_platform}. Adding to blocklist and searching alternative platforms..."})
-                        tried_urls.append(profile_url)
-                        continue # Loop back to the very top (Stage 1 search) to find a new URL
-                    
+                        continue # Already added to tried_urls, loop back to find a new URL
+                        
                 # Quality Check: Ensure at least one college is properly named
                 has_valid_college = False
                 for c in extracted_data.colleges:
                     name_lower = c.name.lower().strip()
-                    if len(name_lower) > 3 and "not specified" not in name_lower and "unspecified" not in name_lower:
+                    if len(name_lower) > 2 and "not specified" not in name_lower and "unspecified" not in name_lower:
                         has_valid_college = True
                         break
                         
@@ -303,40 +354,56 @@ async def extract_doctor_data(websocket: WebSocket):
                         continue
                     else:
                         await websocket.send_json({"type": "status", "message": f"Retries exhausted. Data found on {source_platform} lacks institution names. Rejecting and searching for an alternative..."})
-                        tried_urls.append(profile_url)
                         continue
+
+                # Merge logic
+                if not registrations and extracted_data.registrations:
+                    registrations = extracted_data.registrations
                     
-                await websocket.send_json({"type": "status", "message": f"Found {len(extracted_data.colleges)} colleges. Routing to Tavily..."})
-                
-                final_colleges = []
-                for college_obj in extracted_data.colleges:
-                     await websocket.send_json({"type": "status", "message": f"Determining type for college: {college_obj.name}..."})
-                     # Pass the whole object as json so the LLM retains degree and year
-                     enrich_result = await enrichment_agent.run(college_obj.model_dump_json())
-                     final_colleges.append(enrich_result.output)
-                     
-                # Construct final profile
-                final_profile = DoctorFinalProfile(
-                     name=name,
-                     hospital=hospital,
-                     profile_url=profile_url,
-                     source_platform=source_platform,
-                     colleges=final_colleges,
-                     registrations=extracted_data.registrations
-                )
-                
-                await websocket.send_json({
-                    "type": "final_result",
-                    "data": final_profile.model_dump()
-                })
-                
-                # End the outer loop after a successful extraction
-                break
-                
+                for c in extracted_data.colleges:
+                    if not c.degree: continue
+                    has_valid_name = len(c.name.lower().strip()) > 2 and "not specified" not in c.name.lower() and "unspecified" not in c.name.lower()
+                    if has_valid_name and c.degree not in extracted_degrees:
+                        extracted_degrees.add(c.degree)
+                        aggregated_colleges.append(c)
+                        
             except Exception as e:
-                await websocket.send_json({"type": "error", "message": f"Extraction failed: {str(e)}"})
-                break
-            
+                # Silently catch exceptions in background threads, unless it's the very first URL
+                if not primary_url_confirmed:
+                    await websocket.send_json({"type": "error", "message": f"Extraction failed on primary URL: {str(e)}"})
+                    return
+                continue
+
+        # -------------------------------------------------------------
+        # Stage 4: Enrichment & Final Result
+        # -------------------------------------------------------------
+        if not aggregated_colleges:
+             await websocket.send_json({"type": "error", "message": "Failed to extract any valid colleges from all searched sources."})
+             return
+             
+        await websocket.send_json({"type": "status", "message": f"Found {len(aggregated_colleges)} unique colleges across {total_urls_checked} sources. Routing to Tavily..."})
+        
+        final_colleges = []
+        for college_obj in aggregated_colleges:
+             await websocket.send_json({"type": "status", "message": f"Determining type for college: {college_obj.name}..."})
+             enrich_result = await enrichment_agent.run(college_obj.model_dump_json())
+             final_colleges.append(enrich_result.output)
+             
+        final_profile = DoctorFinalProfile(
+             name=name,
+             hospital=hospital,
+             profile_url=tried_urls[0] if tried_urls else "", # primary URL
+             source_platform=primary_source_platform or "",
+             colleges=final_colleges,
+             registrations=registrations
+        )
+        
+        await websocket.send_json({"type": "status", "message": f"Operation complete. Hit {len(extracted_degrees)} distinct degrees after checking {total_urls_checked} URLs."})
+        await websocket.send_json({
+            "type": "final_result",
+            "data": final_profile.model_dump()
+        })
+        
     except WebSocketDisconnect:
         print("Client disconnected.")
     except Exception as e:
