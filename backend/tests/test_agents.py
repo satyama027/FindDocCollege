@@ -1,4 +1,5 @@
 import pytest
+import json
 from pydantic_ai.models.test import TestModel
 from pydantic_ai import result
 
@@ -65,8 +66,8 @@ async def test_extraction_agent():
     # Mock what the LLM should output after reading that markdown
     mocked_extraction = {
         "colleges": [
-            "Bangalore Medical College and Research Institute",
-            "King Edward Memorial Hospital and Seth Gordhandas Sunderdas Medical College"
+            {"name": "Bangalore Medical College and Research Institute", "degree": "MBBS", "year": 1999},
+            {"name": "King Edward Memorial Hospital and Seth Gordhandas Sunderdas Medical College", "degree": "MD - Pediatrics", "year": 2003}
         ],
         "registrations": ["54321 Karnataka Medical Council"]
     }
@@ -76,7 +77,9 @@ async def test_extraction_agent():
         
         # Verify the college name was extracted into the Pydantic schema correctly
         assert len(result.output.colleges) == 2
-        assert "Bangalore Medical College and Research Institute" in result.output.colleges
+        assert result.output.colleges[0].name == "Bangalore Medical College and Research Institute"
+        assert result.output.colleges[0].degree == "MBBS"
+        assert result.output.colleges[0].year == 1999
         assert len(result.output.registrations) == 1
 
 
@@ -92,15 +95,19 @@ async def test_enrichment_agent():
     # Mock the LLM classification result
     mocked_college_info = {
         "name": college_name,
+        "degree": "MBBS",
+        "year": 1999,
         "is_government": True,
         "is_private": False
     }
     
     with enrichment_agent.override(model=TestModel(custom_output_args=mocked_college_info)):
-        result = await enrichment_agent.run(college_name)
+        result = await enrichment_agent.run(json.dumps({"name": college_name, "degree": "MBBS", "year": 1999}))
         
         # Verify classification
         assert result.output.name == college_name
+        assert result.output.degree == "MBBS"
+        assert result.output.year == 1999
         assert result.output.is_government is True
         assert result.output.is_private is False
 
@@ -280,8 +287,8 @@ async def test_jina_markdown_fetch(monkeypatch):
     )
     
     with search_agent.override(model=TestModel(custom_output_args=mock_search)):
-        with extraction_agent.override(model=TestModel(custom_output_args={"colleges":["Mock College"], "registrations":[]})):
-            with enrichment_agent.override(model=TestModel(custom_output_args={"name":"Mock College","is_government":True,"is_private":False})):
+        with extraction_agent.override(model=TestModel(custom_output_args={"colleges":[{"name": "Mock College", "degree": "MBBS", "year": 2000}], "registrations":[]})):
+            with enrichment_agent.override(model=TestModel(custom_output_args={"name":"Mock College","degree":"MBBS","year":2000,"is_government":True,"is_private":False})):
                 
                 # Connect to the WebSocket
                 with client.websocket_connect("/ws/extract") as websocket:
@@ -327,12 +334,14 @@ async def test_enrichment_agent_tool_call():
     
     mocked_college_info = {
         "name": "Live College Test",
+        "degree": "MD",
+        "year": 2010,
         "is_government": False,
         "is_private": True
     }
     
     with enrichment_agent.override(model=TestModel(custom_output_args=mocked_college_info, call_tools='all')):
-        result = await enrichment_agent.run("Live College Test")
+        result = await enrichment_agent.run(json.dumps({"name": "Live College Test", "degree": "MD", "year": 2010}))
         assert result.output.is_government is False
 
 
@@ -409,12 +418,12 @@ async def test_extraction_fallback_loop(monkeypatch):
         if extract_calls[0] == 0:
             extract_calls[0] += 1
             return MockExtractResult({"colleges": [], "registrations": []})
-        return MockExtractResult({"colleges": ["Mock College"], "registrations": ["Mock Reg"]})
+        return MockExtractResult({"colleges": [{"name": "Mock College", "degree": "MBBS", "year": 2005}], "registrations": ["Mock Reg"]})
 
-    async def mock_enrich_run(college: str, **kwargs):
+    async def mock_enrich_run(college_json: str, **kwargs):
         class MockEnrichResult:
             def __init__(self):
-                self.output = CollegeInfo(name="Mock College", is_government=True, is_private=False)
+                self.output = CollegeInfo(name="Mock College", degree="MBBS", year=2005, is_government=True, is_private=False)
         return MockEnrichResult()
 
     import main

@@ -248,7 +248,15 @@ function App() {
               <ul className="college-list">
                 {finalProfile.colleges.map((col, idx) => (
                   <li key={idx} className="college-item">
-                    <div className="result-value">{col.name}</div>
+                    <div className="result-value">
+                      {col.name}
+                      {(col.degree || col.year) && (
+                        <div style={{ fontSize: '0.875rem', color: '#64748B', marginTop: '0.25rem' }}>
+                          {col.degree && <span><strong>Degree:</strong> {col.degree} </span>}
+                          {col.year && <span><strong>Year:</strong> {col.year}</span>}
+                        </div>
+                      )}
+                    </div>
                     <span className={`badge ${col.is_government ? 'badge-gov' : 'badge-private'}`}>
                       {col.is_government ? 'Government Institution' : 'Private Institution'}
                     </span>

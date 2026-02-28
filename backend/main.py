@@ -49,13 +49,20 @@ class DoctorSearchResult(BaseModel):
     found_specialty: Optional[str] = Field(description="The specialty of the doctor as it appeared in the search results.")
     confidence_reasoning: str = Field(description="Brief explanation of why this URL was chosen or why it was not found.")
 
+class ExtractedCollege(BaseModel):
+    name: str = Field(description="Name of the college or university")
+    degree: Optional[str] = Field(default=None, description="The degree obtained (e.g., MBBS, MD, MS)")
+    year: Optional[int] = Field(default=None, description="The year of graduation if available")
+
 class DoctorExtractedData(BaseModel):
     """Data extracted directly from the Firecrawl scrape"""
-    colleges: List[str] = Field(default_factory=list, description="List of college or university names where the given doctor studied.")
+    colleges: List[ExtractedCollege] = Field(default_factory=list, description="List of colleges where the doctor studied, including degree and year.")
     registrations: List[str] = Field(default_factory=list, description="Registration details, such as registration number and medical council.")
 
 class CollegeInfo(BaseModel):
     name: str = Field(description="Name of the college or university")
+    degree: Optional[str] = Field(default=None, description="The degree obtained")
+    year: Optional[int] = Field(default=None, description="The year of graduation")
     is_government: bool = Field(description="True if it is a government/public institution")
     is_private: bool = Field(description="True if it is a private institution")
 
@@ -117,8 +124,9 @@ extraction_agent = Agent(
     system_prompt=(
         "You are an expert data extractor. I will provide you with the raw markdown text "
         "scraped from a doctor's Practo profile. Your job is to extract their educational "
-        "colleges (where they studied for their degrees) and their medical registrations. "
-        "Return the exact names of the colleges and the exact text of the registrations."
+        "history (where they studied for their degrees) and their medical registrations. "
+        "For each college, extract the college name, the degree obtained (e.g. MBBS, MD), and the graduation year if available. "
+        "Return the exact text of the registrations. "
         "If they are not found, return empty lists."
     )
 )
@@ -128,17 +136,17 @@ enrichment_agent = Agent(
     MODEL,
     output_type=CollegeInfo,
     system_prompt=(
-        "You are an expert researcher. I will provide you with the name of a medical college in India. "
-        "You must determine if it is a government (public) institution or a private institution. "
-        "Use the `search_college_type` tool to search the web for evidence. "
-        "Based on the search results, return the CollegeInfo, setting is_government and is_private appropriately."
+        "You are an expert researcher. I will provide you with a JSON object representing a medical college in India, including the degree and year. "
+        "You must determine if the college is a government (public) institution or a private institution. "
+        "Use the `search_college_type` tool to search the web for evidence using ONLY the college name. "
+        "Based on the search results, return the CollegeInfo, preserving the original name, degree, and year, while setting is_government and is_private appropriately."
     )
 )
 
 @enrichment_agent.tool
-async def search_college_type(ctx: RunContext[None], college_name: str) -> str:
-    """Uses Tavily to search the web and gather context about a specific medical college."""
-    query = f"Is {college_name} a government or private medical college in India?"
+async def search_college_type(ctx: RunContext[None], college_data: str) -> str:
+    """Uses Tavily to search the web and gather context about a specific medical college. Input should be the college name."""
+    query = f"Is {college_data} a government or private medical college in India?"
     if not tavily_client:
         return "Error: Tavily client not initialized."
     try:
@@ -269,9 +277,10 @@ async def extract_doctor_data(websocket: WebSocket):
                 await websocket.send_json({"type": "status", "message": f"Found {len(extracted_data.colleges)} colleges. Routing to Tavily..."})
                 
                 final_colleges = []
-                for college in extracted_data.colleges:
-                     await websocket.send_json({"type": "status", "message": f"Determining type for college: {college}..."})
-                     enrich_result = await enrichment_agent.run(college)
+                for college_obj in extracted_data.colleges:
+                     await websocket.send_json({"type": "status", "message": f"Determining type for college: {college_obj.name}..."})
+                     # Pass the whole object as json so the LLM retains degree and year
+                     enrich_result = await enrichment_agent.run(college_obj.model_dump_json())
                      final_colleges.append(enrich_result.output)
                      
                 # Construct final profile
