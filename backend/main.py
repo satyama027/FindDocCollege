@@ -225,6 +225,9 @@ async def extract_doctor_data(websocket: WebSocket):
                              
                          additional_context = resp_payload.get("additional_context")
                     else:
+                         # Sanitize the URL in case the LLM hallucinated newlines or spaces
+                         search_data.profile_url = search_data.profile_url.strip().replace(' ', '').replace('\n', '').replace('\r', '')
+                         
                          await websocket.send_json({
                              "type": "search_result",
                              "data": search_data.model_dump()
@@ -268,11 +271,23 @@ async def extract_doctor_data(websocket: WebSocket):
                 extract_result = await extraction_agent.run(markdown_content)
                 extracted_data = extract_result.output
                 
-                # Stage 3: Enrichment
                 if not extracted_data.colleges:
                     await websocket.send_json({"type": "status", "message": f"No educational data found on {source_platform}. Adding to blocklist and searching for an alternative profile..."})
                     tried_urls.append(profile_url)
                     continue # Loop back to the very top (Stage 1 search) to find a new URL
+                    
+                # Quality Check: Ensure at least one college is properly named
+                has_valid_college = False
+                for c in extracted_data.colleges:
+                    name_lower = c.name.lower().strip()
+                    if len(name_lower) > 3 and "not specified" not in name_lower and "unspecified" not in name_lower:
+                        has_valid_college = True
+                        break
+                        
+                if not has_valid_college:
+                    await websocket.send_json({"type": "status", "message": f"Data found on {source_platform} lacks institution names. Rejecting and searching for an alternative..."})
+                    tried_urls.append(profile_url)
+                    continue
                     
                 await websocket.send_json({"type": "status", "message": f"Found {len(extracted_data.colleges)} colleges. Routing to Tavily..."})
                 
