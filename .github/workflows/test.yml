@@ -28,5 +28,7 @@ jobs:
       working-directory: ./backend
       env:
         PYTHONPATH: "."
+        GEMINI_API_KEY: "dummy-key-for-ci"
+        TAVILY_API_KEY: "dummy-key-for-ci"
       run: |
         python -m pytest tests/test_agents.py --disable-warnings -q
